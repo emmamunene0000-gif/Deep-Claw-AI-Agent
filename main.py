@@ -154,12 +154,29 @@ def _build_broker_adapters(symbols: list[str]) -> dict:
     Adapters without live clients log MOCK for every action.
     """
     from deep_claw.action.deriv_multiplier import DerivMultiplierAdapter
+    from deep_claw.action.deriv_trading_ws import DerivTradingWS
     from deep_claw.action.bybit_perp import BybitPerpAdapter
     from deep_claw.action.mt5_cfd import MT5CFDAdapter
     from deep_claw.cognition.risk.notional_router import get_instrument
 
     adapters = {}
     bybit_client = _build_bybit_client()
+
+    # One shared trading WS for all Deriv symbols (one account = one auth)
+    deriv_trading_ws: DerivTradingWS | None = None
+    if settings.deriv_api_token:
+        deriv_trading_ws = DerivTradingWS(
+            token=settings.deriv_api_token,
+            ws_url=settings.deriv_ws_url,
+            app_id=settings.deriv_app_id,
+        )
+        logging.getLogger("deep_claw.main").info(
+            "Deriv trading WS created (lazy-connects on first trade)"
+        )
+    else:
+        logging.getLogger("deep_claw.main").warning(
+            "DERIV_API_TOKEN not set — Deriv adapter in MOCK mode"
+        )
 
     for sym in symbols:
         try:
@@ -168,7 +185,7 @@ def _build_broker_adapters(symbols: list[str]) -> dict:
             continue
 
         if inst.preferred_venue == "deriv_multiplier":
-            adapters[sym] = DerivMultiplierAdapter(ws_client=None)  # WS client injected by feed
+            adapters[sym] = DerivMultiplierAdapter(trading_ws=deriv_trading_ws)
 
         elif inst.preferred_venue == "bybit_perp":
             adapters[sym] = BybitPerpAdapter(client=bybit_client)

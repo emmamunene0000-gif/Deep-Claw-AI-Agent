@@ -1,0 +1,13 @@
+run = "bash bootstrap.sh"
+entrypoint = "main.py"
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+PYTHONPATH = "."
+PYTHONUNBUFFERED = "1"
+
+[deployment]
+run = ["sh", "-c", "python main.py VOLATILITY_75_INDEX"]
+deploymentTarget = "cloudrun"
