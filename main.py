@@ -114,7 +114,16 @@ async def main(symbols: list[str]) -> None:
     except ImportError:
         log.info("uvicorn not installed — dashboard disabled")
 
-    # ── 7. Graceful shutdown wiring ──────────────────────────────────────────
+    # ── 7. Jarvis Telegram command center ───────────────────────────────────
+    from deep_claw.communication.telegram_commands import TelegramCommandCenter
+    jarvis = TelegramCommandCenter(
+        token=settings.tg_warroom_token,
+        orchestrator=orch,
+    )
+    jarvis_task = asyncio.create_task(jarvis.start())
+    log.info("Jarvis command center starting")
+
+    # ── 8. Graceful shutdown wiring ──────────────────────────────────────────
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -125,7 +134,7 @@ async def main(symbols: list[str]) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
-    # ── 8. Run all feed tasks concurrently ───────────────────────────────────
+    # ── 9. Run all feed tasks concurrently ───────────────────────────────────
     feed_tasks = [asyncio.create_task(f.start()) for f in feeds]
 
     _print_banner(symbols)
@@ -134,12 +143,14 @@ async def main(symbols: list[str]) -> None:
     # Wait until shutdown signal
     await stop_event.wait()
 
-    # ── 9. Shutdown ──────────────────────────────────────────────────────────
+    # ── 10. Shutdown ─────────────────────────────────────────────────────────
     log.info("Stopping feeds...")
     for f in feeds:
         await f.stop()
     for t in feed_tasks:
         t.cancel()
+    await jarvis.stop()
+    jarvis_task.cancel()
     if dashboard_task:
         dashboard_task.cancel()
 
