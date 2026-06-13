@@ -1,0 +1,187 @@
+# Deep Claw — Instrument Registry
+# Single config object read by both notional_router.py (Cognition) and Action adapters.
+# Never special-case asset assumptions outside this file.
+#
+# contract_notional: value per base unit for P&L calculation
+#   forex:    100_000 (standard lot)
+#   crypto:   1.0 (qty is in base asset units)
+#   futures:  pointvalue (from broker spec)
+#   synthetic: 1.0 (Deriv synthetics trade as crypto-like on multipliers)
+#
+# pip_size: price movement per 1 pip
+# point_value: for futures/indices — MT5 syminfo.pointvalue equivalent
+
+instruments:
+
+  # ── Tier S: Deriv synthetics ──────────────────────────────────────────────
+  - symbol: VOLATILITY_75_INDEX
+    deriv_code: R_75
+    bybit_symbol: null
+    mt5_symbol: Volatility 75 Index
+    asset_class: synthetic
+    pip_size: 0.01
+    contract_notional: 1.0
+    min_unit: 0.01
+    session_profile: "24_7"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  - symbol: VOLATILITY_100_INDEX
+    deriv_code: R_100
+    bybit_symbol: null
+    mt5_symbol: Volatility 100 Index
+    asset_class: synthetic
+    pip_size: 0.01
+    contract_notional: 1.0
+    min_unit: 0.01
+    session_profile: "24_7"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  - symbol: VOLATILITY_50_INDEX
+    deriv_code: R_50
+    bybit_symbol: null
+    mt5_symbol: Volatility 50 Index
+    asset_class: synthetic
+    pip_size: 0.01
+    contract_notional: 1.0
+    min_unit: 0.01
+    session_profile: "24_7"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  - symbol: STEP_INDEX
+    deriv_code: STPIDX
+    bybit_symbol: null
+    mt5_symbol: Step Index
+    asset_class: synthetic
+    pip_size: 0.1
+    contract_notional: 1.0
+    min_unit: 0.01
+    session_profile: "24_7"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  # ── Tier A: XAUUSD (Deriv multiplier) ────────────────────────────────────
+  - symbol: XAUUSD
+    deriv_code: frxXAUUSD
+    bybit_symbol: XAUUSDT
+    mt5_symbol: XAUUSD
+    asset_class: forex
+    pip_size: 0.01         # gold pip = $0.01 per oz — NOT 0.0001 (JPY edge case note)
+    contract_notional: 100.0  # Deriv gold multiplier contract: 100 oz equivalent
+    min_unit: 0.01
+    session_profile: "session_based"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  # ── Tier A: Bybit perpetuals ──────────────────────────────────────────────
+  - symbol: BTCUSDT
+    deriv_code: null
+    bybit_symbol: BTCUSDT
+    mt5_symbol: null
+    asset_class: crypto
+    pip_size: 0.5          # BTC moves in $0.5 increments on Bybit
+    contract_notional: 1.0
+    min_unit: 0.001
+    session_profile: "24_7"
+    preferred_venue: bybit_perp
+    point_value: null
+
+  - symbol: ETHUSDT
+    deriv_code: null
+    bybit_symbol: ETHUSDT
+    mt5_symbol: null
+    asset_class: crypto
+    pip_size: 0.05
+    contract_notional: 1.0
+    min_unit: 0.01
+    session_profile: "24_7"
+    preferred_venue: bybit_perp
+    point_value: null
+
+  - symbol: SOLUSDT
+    deriv_code: null
+    bybit_symbol: SOLUSDT
+    mt5_symbol: null
+    asset_class: crypto
+    pip_size: 0.01
+    contract_notional: 1.0
+    min_unit: 0.1
+    session_profile: "24_7"
+    preferred_venue: bybit_perp
+    point_value: null
+
+  # ── Tier B: Deriv forex multipliers ──────────────────────────────────────
+  - symbol: GBPUSD
+    deriv_code: frxGBPUSD
+    bybit_symbol: null
+    mt5_symbol: GBPUSD
+    asset_class: forex
+    pip_size: 0.0001
+    contract_notional: 100000.0
+    min_unit: 0.01
+    session_profile: "session_based"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  - symbol: EURUSD
+    deriv_code: frxEURUSD
+    bybit_symbol: null
+    mt5_symbol: EURUSD
+    asset_class: forex
+    pip_size: 0.0001
+    contract_notional: 100000.0
+    min_unit: 0.01
+    session_profile: "session_based"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  - symbol: GBPJPY
+    deriv_code: frxGBPJPY
+    bybit_symbol: null
+    mt5_symbol: GBPJPY
+    asset_class: forex
+    pip_size: 0.01         # JPY pairs: pip = 0.01
+    contract_notional: 100000.0
+    min_unit: 0.01
+    session_profile: "session_based"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  - symbol: EURJPY
+    deriv_code: frxEURJPY
+    bybit_symbol: null
+    mt5_symbol: EURJPY
+    asset_class: forex
+    pip_size: 0.01
+    contract_notional: 100000.0
+    min_unit: 0.01
+    session_profile: "session_based"
+    preferred_venue: deriv_multiplier
+    point_value: null
+
+  # ── Tier D: MT5 indices (Atlas funded account) ────────────────────────────
+  - symbol: WALL_STREET_30
+    deriv_code: null
+    bybit_symbol: null
+    mt5_symbol: Wall Street 30
+    asset_class: futures
+    pip_size: 1.0
+    contract_notional: 1.0
+    min_unit: 0.01
+    session_profile: "session_based"
+    preferred_venue: mt5_cfd
+    point_value: 1.0
+
+  - symbol: US_TECH_100
+    deriv_code: null
+    bybit_symbol: null
+    mt5_symbol: US Tech 100
+    asset_class: futures
+    pip_size: 0.25
+    contract_notional: 1.0
+    min_unit: 0.01
+    session_profile: "session_based"
+    preferred_venue: mt5_cfd
+    point_value: 1.0
