@@ -114,7 +114,16 @@ async def main(symbols: list[str]) -> None:
     except ImportError:
         log.info("uvicorn not installed — dashboard disabled")
 
-    # ── 7. Graceful shutdown wiring ──────────────────────────────────────────
+    # ── 7. Jarvis Telegram command center ───────────────────────────────────
+    from deep_claw.communication.telegram_commands import TelegramCommandCenter
+    jarvis = TelegramCommandCenter(
+        token=settings.tg_warroom_token,
+        orchestrator=orch,
+    )
+    jarvis_task = asyncio.create_task(jarvis.start())
+    log.info("Jarvis command center starting")
+
+    # ── 8. Graceful shutdown wiring ──────────────────────────────────────────
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -125,7 +134,7 @@ async def main(symbols: list[str]) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
-    # ── 8. Run all feed tasks concurrently ───────────────────────────────────
+    # ── 9. Run all feed tasks concurrently ───────────────────────────────────
     feed_tasks = [asyncio.create_task(f.start()) for f in feeds]
 
     _print_banner(symbols)
@@ -134,12 +143,14 @@ async def main(symbols: list[str]) -> None:
     # Wait until shutdown signal
     await stop_event.wait()
 
-    # ── 9. Shutdown ──────────────────────────────────────────────────────────
+    # ── 10. Shutdown ─────────────────────────────────────────────────────────
     log.info("Stopping feeds...")
     for f in feeds:
         await f.stop()
     for t in feed_tasks:
         t.cancel()
+    await jarvis.stop()
+    jarvis_task.cancel()
     if dashboard_task:
         dashboard_task.cancel()
 
@@ -154,12 +165,29 @@ def _build_broker_adapters(symbols: list[str]) -> dict:
     Adapters without live clients log MOCK for every action.
     """
     from deep_claw.action.deriv_multiplier import DerivMultiplierAdapter
+    from deep_claw.action.deriv_trading_ws import DerivTradingWS
     from deep_claw.action.bybit_perp import BybitPerpAdapter
     from deep_claw.action.mt5_cfd import MT5CFDAdapter
     from deep_claw.cognition.risk.notional_router import get_instrument
 
     adapters = {}
     bybit_client = _build_bybit_client()
+
+    # One shared trading WS for all Deriv symbols (one account = one auth)
+    deriv_trading_ws: DerivTradingWS | None = None
+    if settings.deriv_api_token:
+        deriv_trading_ws = DerivTradingWS(
+            token=settings.deriv_api_token,
+            ws_url=settings.deriv_ws_url,
+            app_id=settings.deriv_app_id,
+        )
+        logging.getLogger("deep_claw.main").info(
+            "Deriv trading WS created (lazy-connects on first trade)"
+        )
+    else:
+        logging.getLogger("deep_claw.main").warning(
+            "DERIV_API_TOKEN not set — Deriv adapter in MOCK mode"
+        )
 
     for sym in symbols:
         try:
@@ -168,7 +196,7 @@ def _build_broker_adapters(symbols: list[str]) -> dict:
             continue
 
         if inst.preferred_venue == "deriv_multiplier":
-            adapters[sym] = DerivMultiplierAdapter(ws_client=None)  # WS client injected by feed
+            adapters[sym] = DerivMultiplierAdapter(trading_ws=deriv_trading_ws)
 
         elif inst.preferred_venue == "bybit_perp":
             adapters[sym] = BybitPerpAdapter(client=bybit_client)

@@ -113,6 +113,9 @@ class Orchestrator:
         }
 
         self._running = False
+        self._paused = False
+        self._bars_processed = 0
+        self._startup_time = datetime.now(timezone.utc)
         self._daily_report_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -183,6 +186,7 @@ class Orchestrator:
     async def _process_confirmed_bar(self, candle: NormalizedCandle) -> None:
         """Full processing pipeline for one confirmed M15 bar close."""
         ctx = self._contexts[candle.symbol]
+        self._bars_processed += 1
 
         # 1. Build MarketState from full bus history (all TFs)
         market_state = ctx.market_state_builder.build(self._bus)
@@ -193,13 +197,16 @@ class Orchestrator:
         # 2. Structural episode emission (BOS, CHoCH, session change, ATR regime)
         ctx.episode_emitter.update(market_state)
 
-        # 3. TP/SL price-check on open position
+        # 3. TP/SL price-check on open position (runs even when paused)
         if ctx.position_machine:
             instructions = ctx.position_machine.update_price(market_state)
             for inst in instructions:
                 await self._dispatch_instruction(ctx, inst, market_state)
 
-        # 4. Signal generation — all pure functions, no shared state
+        # 4. Signal generation — skipped when paused by operator
+        if self._paused:
+            return
+
         candidates = _run_signal_generators(market_state)
         if not candidates:
             return
@@ -410,6 +417,96 @@ class Orchestrator:
         await self._run_eod_reports()
         await self._telegram.send_war_room("<b>🔴 DEEP CLAW OFFLINE</b>")
         log.info("Deep Claw shut down cleanly")
+
+    # ── Operator control (Jarvis commands) ───────────────────────────────────
+
+    def pause(self) -> None:
+        self._paused = True
+        log.info("Signal evaluation PAUSED by operator")
+
+    def resume(self) -> None:
+        self._paused = False
+        log.info("Signal evaluation RESUMED by operator")
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def get_status(self) -> dict:
+        elapsed = (datetime.now(timezone.utc) - self._startup_time).total_seconds()
+        h, rem = divmod(int(elapsed), 3600)
+        m = rem // 60
+        return {
+            "symbols": self._symbols,
+            "paused": self._paused,
+            "uptime": f"{h}h {m}m",
+            "bars_processed": self._bars_processed,
+            "open_positions": sum(
+                1 for ctx in self._contexts.values()
+                if ctx.position_machine and getattr(ctx.position_machine, "_state", None) is not None
+            ),
+        }
+
+    def get_open_positions(self) -> list[dict]:
+        result = []
+        for sym, ctx in self._contexts.items():
+            psm = ctx.position_machine
+            if psm is None:
+                continue
+            state = getattr(psm, "_state", None)
+            if state is None:
+                continue
+            direction = getattr(state, "direction", "?")
+            result.append({
+                "symbol": sym,
+                "direction": direction.value if hasattr(direction, "value") else str(direction),
+                "entry": float(getattr(state, "entry", 0)),
+                "sl": float(getattr(state, "sl", 0)),
+                "tp1": float(getattr(state, "tp1", 0)),
+                "size_usd": float(getattr(state, "size_usd_risk", 0)),
+                "trade_id": getattr(state, "trade_id", "?"),
+            })
+        return result
+
+    def get_last_reasoning(self) -> str:
+        for sym in self._symbols:
+            recent = self._stream.recent(sym, n=30)
+            for ep in reversed(recent):
+                if ep.episode_type in {EpisodeType.SIGNAL_ACCEPTED, EpisodeType.SIGNAL_REJECTED}:
+                    reasoning = (
+                        ep.payload.get("claude_reasoning")
+                        or ep.payload.get("causal_trace")
+                        or ep.payload.get("episodic_note")
+                        or ""
+                    )
+                    if reasoning:
+                        ts = ep.timestamp.strftime("%H:%M UTC")
+                        return f"[{ep.episode_type.value} @ {ts} — {sym}]\n\n{reasoning}"
+        return ""
+
+    def get_today_summary(self) -> str:
+        lines = []
+        for sym, ctx in self._contexts.items():
+            try:
+                summary = self._renderer.to_daily_summary(sym, ctx.session_start)
+                lines.append(f"<b>{sym}</b>\n{summary}")
+            except Exception:
+                lines.append(f"<b>{sym}</b>\nNo data yet.")
+        return "\n\n".join(lines) if lines else "No data yet."
+
+    def get_risk_exposure(self) -> dict:
+        daily_trades = signals_fired = signals_blocked = 0
+        for ctx in self._contexts.values():
+            pt = ctx.pip_tracker
+            stats = pt.get_stats() if hasattr(pt, "get_stats") else {}
+            daily_trades += stats.get("total_trades", 0)
+            signals_fired += stats.get("signals_fired", 0)
+            signals_blocked += stats.get("signals_blocked", 0)
+        return {
+            "daily_trades": daily_trades,
+            "signals_fired": signals_fired,
+            "signals_blocked": signals_blocked,
+        }
 
     # ── Dashboard accessors ───────────────────────────────────────────────────
 

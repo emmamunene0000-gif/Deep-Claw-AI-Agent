@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from deep_claw.action.protocol import BrokerAdapter
+from deep_claw.action.deriv_trading_ws import DerivTradingWS
 from deep_claw.core.types import Direction, PositionHandle, TradeInstruction, Venue
 from deep_claw.config.settings import settings
 
@@ -23,12 +24,16 @@ log = logging.getLogger(__name__)
 class DerivMultiplierAdapter:
     """
     Implements BrokerAdapter for Deriv Multiplier contracts.
-    Connects via WebSocket to the Deriv WS API.
+    Uses a dedicated DerivTradingWS for all execution calls.
     """
 
-    def __init__(self, ws_client: Any | None = None) -> None:
-        self._ws = ws_client  # injected Deriv WS connection
+    def __init__(self, trading_ws: DerivTradingWS | None = None) -> None:
+        self._trading_ws = trading_ws  # None → MOCK mode
         self._pending: dict[str, Any] = {}  # trade_id → contract details
+
+    @property
+    def _ws(self) -> DerivTradingWS | None:
+        return self._trading_ws
 
     async def open_position(self, instruction: TradeInstruction) -> PositionHandle:
         """
@@ -62,19 +67,19 @@ class DerivMultiplierAdapter:
             instruction.size_usd_risk, stop_loss_usd,
         )
 
-        if self._ws is None:
-            log.warning("No WS client — returning mock handle for %s", instruction.trade_id)
+        if self._trading_ws is None:
+            log.warning("No trading WS — returning MOCK handle for %s", instruction.trade_id)
             return PositionHandle(
                 venue=Venue.DERIV_MULTIPLIER,
                 broker_ref=f"MOCK_{instruction.trade_id}",
                 trade_id=instruction.trade_id,
             )
 
-        # Real flow
-        proposal_resp = await self._send(proposal_req)
+        # Real flow: proposal → buy
+        proposal_resp = await self._trading_ws.send(proposal_req)
         proposal_id = proposal_resp["proposal"]["id"]
 
-        buy_resp = await self._send({
+        buy_resp = await self._trading_ws.send({
             "buy": proposal_id,
             "price": proposal_resp["proposal"]["ask_price"],
         })
@@ -107,11 +112,11 @@ class DerivMultiplierAdapter:
         new_sl_distance = abs(instruction.entry - new_sl)
         new_sl_usd = new_sl_distance * instruction.size_units
 
-        if self._ws is None:
+        if self._trading_ws is None:
             log.info("MOCK modify_stop: contract=%s new_sl_usd=$%.2f", handle.broker_ref, new_sl_usd)
             return
 
-        await self._send({
+        await self._trading_ws.send({
             "contract_update": 1,
             "contract_id": int(handle.broker_ref),
             "limit_order": {"stop_loss": new_sl_usd},
@@ -123,25 +128,25 @@ class DerivMultiplierAdapter:
         if not details:
             return
 
-        if self._ws is None:
+        if self._trading_ws is None:
             log.info("MOCK partial_close: contract=%s fraction=%.2f", handle.broker_ref, fraction)
             return
 
-        await self._send({
+        await self._trading_ws.send({
             "sell_contract_for_multiple_accounts": 1,
             "contract_id": int(handle.broker_ref),
-            "price": 0,  # market
-            "tokens": [],  # handled by Deriv backend
+            "price": 0,
+            "tokens": [],
         })
         log.info("Partial close sent: contract=%s fraction=%.2f", handle.broker_ref, fraction)
 
     async def close_position(self, handle: PositionHandle) -> None:
-        if self._ws is None:
+        if self._trading_ws is None:
             log.info("MOCK close_position: contract=%s", handle.broker_ref)
             self._pending.pop(handle.trade_id, None)
             return
 
-        await self._send({
+        await self._trading_ws.send({
             "sell": int(handle.broker_ref),
             "price": 0,
         })
@@ -149,22 +154,15 @@ class DerivMultiplierAdapter:
         log.info("Position closed: contract=%s", handle.broker_ref)
 
     async def get_live_pnl(self, handle: PositionHandle) -> float:
-        if self._ws is None:
+        if self._trading_ws is None:
             return 0.0
-        resp = await self._send({
+        resp = await self._trading_ws.send({
             "proposal_open_contract": 1,
             "contract_id": int(handle.broker_ref),
         })
         return float(resp.get("proposal_open_contract", {}).get("profit", 0.0))
 
-    # ── Internal ──────────────────────────────────────────────────────────────
-
     def _select_multiplier(self, instruction: TradeInstruction) -> int:
-        """
-        Select multiplier based on instrument type.
-        Default 100x for synthetic indices, 200x for forex.
-        Decoupled from risk sizing — multiplier only affects margin, not $ risk.
-        """
         from deep_claw.cognition.risk.notional_router import get_instrument
         inst = get_instrument(instruction.symbol)
         if inst.asset_class.value == "synthetic":
@@ -172,9 +170,3 @@ class DerivMultiplierAdapter:
         elif inst.asset_class.value == "forex":
             return 200
         return 100
-
-    async def _send(self, payload: dict) -> dict:
-        """Send a request to the Deriv WS API and await response."""
-        await self._ws.send(json.dumps(payload))
-        response = await self._ws.recv()
-        return json.loads(response)
