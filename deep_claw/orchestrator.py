@@ -1,25 +1,23 @@
 """
 Deep Claw Orchestrator — the main async event loop.
 
-Wiring:
-  CandleBus → MarketStateBuilder → EpisodeEmitter
-           → [ut_bot, smart_rsi, liquidity_zone, structure_shift]
-           → ChainReasoningEngine → ConfidenceEngine
-           → [Claude qualification (optional)]
-           → PositionStateMachine → BrokerAdapter
-           → EpisodeStream → Renderer → Telegram
+Data flow (one confirmed bar close triggers everything):
+  Feed (Deriv/Bybit WS) → NormalizedCandleBus.ingest() → _on_confirmed_bar()
+    → MarketStateBuilder.build()        → MarketState
+    → EpisodeEmitter.update()           → structural episodes (BOS/CHoCH/session)
+    → PositionStateMachine.update_price()  → TP/SL progression
+    → [4 pure signal generators]        → List[SignalCandidate]
+    → ChainReasoningEngine.evaluate()   → ChainVerdict
+    → confidence()                      → ConfidenceResult
+    → [optional Claude qualification]   → QualificationVerdict
+    → PositionStateMachine.process_candidates() → TradeInstruction
+    → BrokerAdapter.open_position()     → PositionHandle
+    → Telegram, FeatureStore, PipTracker
 
-One PositionStateMachine per symbol. CandleBus is shared across all.
-The orchestrator owns no trade state — it is a pure routing layer.
+The orchestrator owns NO trade state. All state lives in PositionStateMachine.
+The bus is the bridge between feeds and processing — the only data path.
 
-Lifecycle:
-  1. startup()  — connect broker feeds, backfill outcome labeler
-  2. run()      — event loop until shutdown signal
-  3. shutdown() — flush, write daily reports, disconnect
-
-Phase 2 swap point:
-  Replace `confidence_v1.confidence(ms, weights)` with
-  `learning.inference.predict_confidence(ms)` by setting USE_ML_CONFIDENCE=true.
+Phase 2 swap: set USE_ML_CONFIDENCE=true to route through learning/inference.py.
 """
 from __future__ import annotations
 
@@ -27,7 +25,6 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from deep_claw.action.protocol import BrokerAdapter
 from deep_claw.claude.daily_assessment import run_daily_assessment
@@ -40,7 +37,6 @@ from deep_claw.cognition.signals.liquidity_zone import liquidity_zone_signal
 from deep_claw.cognition.signals.smart_rsi import smart_rsi_signal
 from deep_claw.cognition.signals.structure_shift import structure_shift_signal
 from deep_claw.cognition.signals.ut_bot import ut_bot_signal
-from deep_claw.communication.dashboard import build_app
 from deep_claw.communication.renderer import EpisodeStreamRenderer
 from deep_claw.communication.telegram import TelegramDispatcher
 from deep_claw.config.settings import settings
@@ -49,8 +45,10 @@ from deep_claw.core.types import (
     Episode,
     EpisodeType,
     MarketState,
+    NormalizedCandle,
     PositionHandle,
     SignalCandidate,
+    Timeframe,
     TradeInstruction,
 )
 from deep_claw.journal.daily_report import DailyReport
@@ -58,41 +56,46 @@ from deep_claw.journal.episode_stream import EpisodeStream
 from deep_claw.journal.feature_store import FeatureStore
 from deep_claw.journal.outcome_labeler import OutcomeLabeler
 from deep_claw.journal.pip_tracker import PipTracker
+from deep_claw.perception.candle_bus import NormalizedCandleBus
 from deep_claw.perception.episode_emitter import EpisodeEmitter
 from deep_claw.perception.market_state import MarketStateBuilder
 
 log = logging.getLogger(__name__)
 
+# Primary timeframe that triggers signal evaluation
+_EXEC_TF = Timeframe.M15
+
 
 class SymbolContext:
-    """All per-symbol state bundled together."""
+    """All per-symbol processing state. The orchestrator creates one per symbol."""
 
     def __init__(self, symbol: str, stream: EpisodeStream) -> None:
         self.symbol = symbol
         self.stream = stream
-        self.market_state_builder = MarketStateBuilder(symbol)
-        self.episode_emitter = EpisodeEmitter(stream)
+        self.market_state_builder = MarketStateBuilder(symbol, exec_tf=_EXEC_TF)
+        self.episode_emitter = EpisodeEmitter(symbol, stream)
         self.chain_engine = ChainReasoningEngine(stream)
         self.pip_tracker = PipTracker(symbol)
-        self.position_machine: PositionStateMachine | None = None  # set after broker adapters ready
+        self.position_machine: PositionStateMachine | None = None
         self.last_market_state: MarketState | None = None
         self.session_start: datetime = datetime.now(timezone.utc)
 
 
 class Orchestrator:
     """
-    Top-level coordinator. Stateless with respect to trade execution —
-    all trade state lives in PositionStateMachine.
+    Stateless routing layer. All trade state lives in PositionStateMachine.
+    Registered as a NormalizedCandleBus handler — woken on each confirmed bar close.
     """
 
     def __init__(
         self,
         symbols: list[str],
-        broker_adapters: dict[str, BrokerAdapter],  # symbol → adapter
+        bus: NormalizedCandleBus,
+        broker_adapters: dict[str, BrokerAdapter],
         db_path: Path = Path("data"),
-        enable_dashboard: bool = True,
     ) -> None:
         self._symbols = [s.upper() for s in symbols]
+        self._bus = bus
         self._broker_adapters = broker_adapters
         self._db_path = db_path
 
@@ -109,26 +112,17 @@ class Orchestrator:
             s: SymbolContext(s, self._stream) for s in self._symbols
         }
 
-        # Dashboard (optional)
-        self._dashboard_app = None
-        if enable_dashboard:
-            try:
-                pip_trackers = {s: ctx.pip_tracker for s, ctx in self._contexts.items()}
-                self._dashboard_app = build_app(
-                    self._stream, self._renderer, pip_trackers, self._daily_report
-                )
-            except RuntimeError:
-                log.info("Dashboard disabled — fastapi not installed")
-
         self._running = False
         self._daily_report_task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def startup(self) -> None:
+        self._loop = asyncio.get_running_loop()
         log.info("Deep Claw startup — symbols: %s", self._symbols)
 
-        # Wire PositionStateMachine for each symbol
+        # Wire PositionStateMachine per symbol
         for sym, ctx in self._contexts.items():
             adapter = self._broker_adapters.get(sym)
             if not adapter:
@@ -143,7 +137,10 @@ class Orchestrator:
                 close_fn=lambda h, a=adapter: asyncio.ensure_future(a.close_position(h)),
             )
 
-        # Backfill outcome labels for any trades that closed while offline
+        # Register bus handler — woken on every confirmed bar close
+        self._bus.register_handler(self._on_confirmed_bar_sync)
+
+        # Backfill outcome labels for trades that closed while offline
         for sym in self._symbols:
             try:
                 labeled = self._outcome_labeler.backfill_from_stream(sym)
@@ -152,257 +149,247 @@ class Orchestrator:
             except Exception as e:
                 log.warning("Backfill failed for %s: %s", sym, e)
 
-        # Schedule EOD report
+        # EOD report scheduler
         self._daily_report_task = asyncio.create_task(self._daily_report_loop())
         self._running = True
-        log.info("Deep Claw ready")
 
-    # ── Main bar handler ──────────────────────────────────────────────────────
+        await self._telegram.send_war_room(
+            "<b>🟢 DEEP CLAW ONLINE</b>\n"
+            f"Symbols: {', '.join(self._symbols)}\n"
+            f"Mode: {'DEMO' if settings.bybit_testnet else 'LIVE'}\n"
+            f"Claude: {'ON' if settings.enable_claude_qualification else 'OFF'}\n"
+            f"ML Confidence: {'ON' if settings.use_ml_confidence else 'OFF (v1 weights)'}"
+        )
+        log.info("Deep Claw ready — registered bus handler for %s", self._symbols)
 
-    async def on_bar(self, symbol: str, candle) -> None:
+    # ── Bus handler ───────────────────────────────────────────────────────────
+
+    def _on_confirmed_bar_sync(self, candle: NormalizedCandle) -> None:
         """
-        Called by the broker feed adapter on each confirmed bar close.
-        This is the single entry point for all price data.
+        Sync entry point called by the bus on each confirmed close.
+        Only processes exec TF candles (M15) for signal generation.
+        All TF candles are already stored in the bus for indicator lookback.
         """
-        ctx = self._contexts.get(symbol)
-        if not ctx:
+        if candle.symbol not in self._contexts:
             return
+        if candle.timeframe != _EXEC_TF:
+            return  # non-exec TF: stored in bus, not processed for signals
+        if self._loop is None:
+            return
+        asyncio.ensure_future(
+            self._process_confirmed_bar(candle), loop=self._loop
+        )
 
-        # 1. Build MarketState from confirmed candle
-        market_state = ctx.market_state_builder.update(candle)
+    async def _process_confirmed_bar(self, candle: NormalizedCandle) -> None:
+        """Full processing pipeline for one confirmed M15 bar close."""
+        ctx = self._contexts[candle.symbol]
+
+        # 1. Build MarketState from full bus history (all TFs)
+        market_state = ctx.market_state_builder.build(self._bus)
         if market_state is None:
-            return  # not enough history yet
+            return  # not enough history
         ctx.last_market_state = market_state
 
-        # 2. Emit structural episodes (session change, BOS, CHoCH, etc.)
+        # 2. Structural episode emission (BOS, CHoCH, session change, ATR regime)
         ctx.episode_emitter.update(market_state)
 
-        # 3. Price check on open position (SL/TP progression)
+        # 3. TP/SL price-check on open position
         if ctx.position_machine:
             instructions = ctx.position_machine.update_price(market_state)
             for inst in instructions:
-                await self._handle_trade_instruction(ctx, inst, market_state)
+                await self._dispatch_instruction(ctx, inst, market_state)
 
-        # 4. Run all signal generators in parallel (pure functions — no shared state)
+        # 4. Signal generation — all pure functions, no shared state
         candidates = _run_signal_generators(market_state)
         if not candidates:
             return
 
-        # 5. Route candidates through chain + confidence + position machine
-        accepted = await self._evaluate_candidates(ctx, candidates, market_state)
-        if accepted:
-            log.debug("%s: %d candidate(s) accepted", symbol, len(accepted))
+        # 5. Route each candidate through the full evaluation pipeline
+        for candidate in candidates:
+            await self._evaluate_candidate(ctx, candidate, market_state)
 
     # ── Signal evaluation pipeline ────────────────────────────────────────────
 
-    async def _evaluate_candidates(
-        self,
-        ctx: SymbolContext,
-        candidates: list[SignalCandidate],
-        market_state: MarketState,
-    ) -> list[TradeInstruction]:
-        instructions = []
-        for candidate in candidates:
-            inst = await self._evaluate_one(ctx, candidate, market_state)
-            if inst:
-                instructions.append(inst)
-        return instructions
-
-    async def _evaluate_one(
+    async def _evaluate_candidate(
         self,
         ctx: SymbolContext,
         candidate: SignalCandidate,
         market_state: MarketState,
-    ) -> TradeInstruction | None:
+    ) -> None:
         # Chain reasoning
         chain_verdict = ctx.chain_engine.evaluate(candidate, market_state)
 
-        # Confidence scoring (Phase 1: hand-tuned weights; Phase 2: ML model)
+        # Confidence scoring
         if settings.use_ml_confidence:
             conf_result = _ml_confidence(market_state)
         else:
             conf_result = confidence(market_state, DEFAULT_WEIGHT_MATRIX)
 
-        # Write feature store row (BEFORE filtering — shadow-blocked rows matter for ML)
-        row_id = self._feature_store.write_candidate(
+        # Write feature row (fired=False initially — updated if accepted below)
+        self._feature_store.write_candidate(
             candidate=candidate,
             market_state=market_state,
             chain_verdict=chain_verdict,
             confidence_result=conf_result,
-            fired=False,  # tentative — updated if accepted
+            fired=False,
             rejection_reason=None,
         )
 
-        # Position machine processes the candidate
         if not ctx.position_machine:
-            return None
+            return
 
+        # Position machine: one-trade rule, confidence gate, SL/TP computation
         instruction = ctx.position_machine.process_candidates([candidate], market_state)
-
         if instruction is None:
-            # Rejected by position machine — feature row stays fired=False
-            return None
+            return  # rejected — feature row stays shadow-blocked (fired=False)
 
-        # Claude qualification (optional gate before broker commit)
+        # Claude qualification (optional pre-commit gate)
         if settings.enable_claude_qualification:
-            verdict = await qualify_signal(
+            qv = await qualify_signal(
                 candidate=candidate,
                 market_state=market_state,
                 chain_verdict=chain_verdict,
                 stream=self._stream,
                 renderer=self._renderer,
             )
-            if verdict.verdict == ClaudeVerdict.REJECT:
-                log.info("Claude REJECTED %s signal for %s", candidate.source.value, ctx.symbol)
-                return None
-            elif verdict.verdict == ClaudeVerdict.MODIFY:
-                instruction = _apply_claude_modifiers(instruction, verdict)
+            if qv.verdict == ClaudeVerdict.REJECT:
+                log.info("Claude REJECTED %s %s", candidate.source.value, ctx.symbol)
+                ctx.pip_tracker.record_blocked()
+                return
+            if qv.verdict == ClaudeVerdict.MODIFY:
+                instruction = _apply_claude_modifiers(instruction, qv)
 
-        # Update feature store: mark as fired=True with trade_id
-        self._feature_store.label_outcome(
-            trade_id=instruction.trade_id or "",
-            realized_r=0.0,
-            exit_reason="PENDING",
-            bar_count=0,
-            mfe_r=0.0,
-            mae_r=0.0,
-            autopsy_tag=None,
+        # Accepted — update feature row, pip tracker
+        self._feature_store.write_candidate(
+            candidate=candidate,
+            market_state=market_state,
+            chain_verdict=chain_verdict,
+            confidence_result=conf_result,
+            fired=True,
+            rejection_reason=None,
+            trade_id=instruction.trade_id,
         )
-
-        # PipTracker
         ctx.pip_tracker.record_signal(market_state.session.value)
 
-        # Telegram — war room signal alert
+        # Dispatch to broker
+        await self._dispatch_instruction(ctx, instruction, market_state)
+
+        # Telegram war room alert
+        dir_conf = conf_result.bull_confidence if candidate.direction.value == "LONG" else conf_result.bear_confidence
         war_room = self._renderer.to_telegram_narrative(
             symbol=ctx.symbol,
             event_title=f"SIGNAL — {candidate.source.value}",
-            event_commentary=f"{candidate.direction.value} | {chain_verdict.verdict.value} | conf {conf_result.directional_confidence:.0f}%",
+            event_commentary=(
+                f"{candidate.direction.value} | {chain_verdict.verdict.value} "
+                f"| conf {dir_conf:.0f}% | R={instruction.tp1:.5f}"
+            ),
             market_state=market_state,
         )
         public = self._renderer.to_telegram_public(war_room)
         asyncio.ensure_future(self._telegram.send_signal_alert(war_room, public))
 
-        return instruction
+    # ── Trade instruction dispatch ────────────────────────────────────────────
 
-    async def _handle_trade_instruction(
+    async def _dispatch_instruction(
         self,
         ctx: SymbolContext,
         instruction: TradeInstruction,
         market_state: MarketState,
     ) -> None:
-        """Route a TradeInstruction to the broker adapter."""
+        """
+        Route a TradeInstruction to the broker adapter.
+        Also handles SL autopsy on stop-outs.
+        """
         adapter = self._broker_adapters.get(ctx.symbol)
         if not adapter:
             return
+
         try:
-            if instruction.action == "OPEN":
+            if getattr(instruction, "action", "OPEN") == "OPEN":
                 handle: PositionHandle = await adapter.open_position(instruction)
-                log.info("Position opened: %s %s", ctx.symbol, instruction.trade_id)
-            elif instruction.action == "CLOSE":
-                # Find handle — position machine tracks it
-                pass  # PositionStateMachine holds the handle and calls adapter directly
+                # Store handle back in position machine
+                if ctx.position_machine and ctx.position_machine._state:
+                    ctx.position_machine._state.handle = handle
+                log.info("Position opened: %s trade_id=%s", ctx.symbol, instruction.trade_id)
+
         except Exception as e:
-            log.error("Broker error for %s: %s", ctx.symbol, e)
-            await self._telegram.send_error(ctx.symbol, str(e))
+            log.error("Broker error [%s]: %s", ctx.symbol, e)
+            asyncio.ensure_future(self._telegram.send_error(ctx.symbol, str(e)))
 
-        # Backfill outcome label after close
-        if instruction.action == "CLOSE" and instruction.trade_id:
-            self._outcome_labeler.process_episode(
-                Episode(
-                    episode_type=EpisodeType.TRADE_CLOSED,
-                    symbol=ctx.symbol,
-                    timestamp=datetime.now(timezone.utc),
-                    payload={
-                        "trade_id": instruction.trade_id,
-                        "realized_r": getattr(instruction, "realized_r", 0.0),
-                        "exit_reason": getattr(instruction, "exit_reason", "UNKNOWN"),
-                    },
-                )
-            )
+        # Outcome labeling for closing events
+        episode_type = getattr(instruction, "_episode_type", None)
+        if episode_type in {EpisodeType.SL_HIT, EpisodeType.TRADE_CLOSED, EpisodeType.HOLDER_EXIT}:
+            recent = self._stream.recent(ctx.symbol, n=1)
+            if recent:
+                self._outcome_labeler.process_episode(recent[0])
 
-        # SL autopsy if stop-out
-        ep_type = getattr(instruction, "_episode_type", None)
-        if ep_type == EpisodeType.SL_HIT:
-            lesson = await run_sl_autopsy(
-                sl_episode=self._stream.recent(ctx.symbol, n=1)[0],
-                market_state=market_state,
-                stream=self._stream,
-            )
-            asyncio.ensure_future(
-                self._telegram.send_sl_autopsy(
-                    ctx.symbol, instruction.trade_id or "?", lesson
-                )
-            )
+            # SL autopsy
+            if episode_type == EpisodeType.SL_HIT:
+                sl_episodes = self._stream.recent(ctx.symbol, n=1)
+                if sl_episodes:
+                    lesson = await run_sl_autopsy(sl_episodes[0], market_state, self._stream)
+                    asyncio.ensure_future(
+                        self._telegram.send_sl_autopsy(ctx.symbol, instruction.trade_id or "?", lesson)
+                    )
 
-    # ── Episode subscription (outcome labeling) ───────────────────────────────
+    # ── Episode subscriber (called by PositionStateMachine via stream callbacks) ─
 
     def on_episode(self, episode: Episode) -> None:
         """
-        Called by EpisodeStream subscribers after each append.
-        Routes outcome-closing episodes to the labeler.
+        Route outcome-closing episodes to labeler and pip tracker.
+        Called by EpisodeStream after each append (if wired).
         """
-        if self._outcome_labeler.process_episode(episode):
-            ctx = self._contexts.get(episode.symbol)
-            if ctx:
-                payload = episode.payload
-                r = payload.get("realized_r", 0.0)
-                exit_reason = payload.get("exit_reason", "")
-                if exit_reason == "SL":
-                    ctx.pip_tracker.record_sl(r)
-                elif exit_reason == "TP1":
-                    ctx.pip_tracker.record_tp1(r)
-                elif exit_reason == "TP2":
-                    ctx.pip_tracker.record_tp2(r)
-                elif exit_reason == "TP3":
-                    ctx.pip_tracker.record_tp3(r)
-                elif exit_reason == "HOLDER_EXIT":
-                    ctx.pip_tracker.record_holder_exit(r)
+        if not self._outcome_labeler.process_episode(episode):
+            return
+        ctx = self._contexts.get(episode.symbol)
+        if not ctx:
+            return
+        payload = episode.payload
+        r = float(payload.get("realized_r", 0.0))
+        reason = payload.get("exit_reason", "")
+        if reason == "SL":
+            ctx.pip_tracker.record_sl(r)
+        elif reason == "TP1":
+            ctx.pip_tracker.record_tp1(r)
+        elif reason == "TP2":
+            ctx.pip_tracker.record_tp2(r)
+        elif reason == "TP3":
+            ctx.pip_tracker.record_tp3(r)
+        elif reason == "HOLDER_EXIT":
+            ctx.pip_tracker.record_holder_exit(r)
 
     # ── EOD report loop ───────────────────────────────────────────────────────
 
     async def _daily_report_loop(self) -> None:
-        """Wait until report_hour_utc, write daily reports, then repeat."""
         while self._running:
             now = datetime.now(timezone.utc)
-            target_hour = settings.report_hour_utc
-            # Seconds until next report window
-            seconds_until = _seconds_until_hour(now, target_hour)
-            await asyncio.sleep(seconds_until)
-            if not self._running:
-                break
-            await self._run_eod_reports()
+            seconds = _seconds_until_hour(now, settings.report_hour_utc)
+            await asyncio.sleep(seconds)
+            if self._running:
+                await self._run_eod_reports()
 
     async def _run_eod_reports(self) -> None:
         log.info("Running EOD daily reports")
         for sym, ctx in self._contexts.items():
             since = ctx.session_start
             try:
-                # Daily assessment via Claude
                 proposals = await run_daily_assessment(
-                    symbol=sym,
-                    since=since,
-                    stream=self._stream,
-                    renderer=self._renderer,
+                    symbol=sym, since=since, stream=self._stream, renderer=self._renderer,
                 )
                 assessment_text = "; ".join(proposals[:3])
 
-                # Write structured daily report row
                 self._daily_report.write(
-                    symbol=sym,
-                    pip_tracker=ctx.pip_tracker,
-                    stream=self._stream,
-                    since=since,
+                    symbol=sym, pip_tracker=ctx.pip_tracker,
+                    stream=self._stream, since=since,
                     assessment_text=assessment_text,
                     proposal_count=len(proposals),
                 )
 
-                # Telegram EOD summary
                 summary = self._renderer.to_daily_summary(sym, since)
                 await self._telegram.send_daily_summary(sym, summary)
                 if proposals:
                     await self._telegram.send_proposal_alert(sym, proposals)
 
-                # Reset session clock
                 ctx.session_start = datetime.now(timezone.utc)
 
             except Exception as e:
@@ -420,21 +407,35 @@ class Orchestrator:
                 await self._daily_report_task
             except asyncio.CancelledError:
                 pass
-        # Final EOD flush
         await self._run_eod_reports()
+        await self._telegram.send_war_room("<b>🔴 DEEP CLAW OFFLINE</b>")
         log.info("Deep Claw shut down cleanly")
 
+    # ── Dashboard accessors ───────────────────────────────────────────────────
 
-# ── Pure helper functions (no class state) ────────────────────────────────────
+    @property
+    def stream(self) -> EpisodeStream:
+        return self._stream
+
+    @property
+    def renderer(self) -> EpisodeStreamRenderer:
+        return self._renderer
+
+    @property
+    def pip_trackers(self) -> dict[str, PipTracker]:
+        return {s: ctx.pip_tracker for s, ctx in self._contexts.items()}
+
+    @property
+    def daily_report(self) -> DailyReport:
+        return self._daily_report
+
+
+# ── Pure helpers ──────────────────────────────────────────────────────────────
 
 def _run_signal_generators(market_state: MarketState) -> list[SignalCandidate]:
-    """
-    All four generators are pure functions. Called in series — fast enough.
-    Each returns SignalCandidate | None. None results are filtered out.
-    """
-    generators = [ut_bot_signal, smart_rsi_signal, liquidity_zone_signal, structure_shift_signal]
+    """All 4 generators are pure functions. Zero shared state between them."""
     results = []
-    for gen in generators:
+    for gen in [ut_bot_signal, smart_rsi_signal, liquidity_zone_signal, structure_shift_signal]:
         try:
             result = gen(market_state)
             if result is not None:
@@ -448,35 +449,26 @@ def _apply_claude_modifiers(
     instruction: TradeInstruction,
     verdict: QualificationVerdict,
 ) -> TradeInstruction:
-    """Apply Claude's size/SL modifications to a TradeInstruction."""
     from dataclasses import replace
+    new_sl = instruction.sl * verdict.sl_modifier if instruction.sl and verdict.sl_modifier != 1.0 else instruction.sl
     return replace(
         instruction,
-        size=instruction.size * verdict.size_modifier,
-        sl=instruction.sl * verdict.sl_modifier if instruction.sl else instruction.sl,
+        size_usd_risk=instruction.size_usd_risk * verdict.size_modifier,
+        sl=new_sl,
     )
 
 
 def _ml_confidence(market_state: MarketState):
-    """
-    Phase 2 swap point. When USE_ML_CONFIDENCE=true, this is called instead of
-    confidence_v1.confidence(). Returns same ConfidenceResult interface.
-    """
     try:
         from deep_claw.learning.inference import predict_confidence
         return predict_confidence(market_state)
     except ImportError:
-        log.warning("ML inference module not available — falling back to v1 confidence")
         return confidence(market_state, DEFAULT_WEIGHT_MATRIX)
 
 
 def _seconds_until_hour(now: datetime, target_hour: int) -> float:
-    """Seconds until the next occurrence of target_hour UTC."""
     if now.hour < target_hour:
-        delta_hours = target_hour - now.hour
-        delta_seconds = delta_hours * 3600 - now.minute * 60 - now.second
+        delta = (target_hour - now.hour) * 3600 - now.minute * 60 - now.second
     else:
-        # Next day
-        delta_hours = 24 - now.hour + target_hour
-        delta_seconds = delta_hours * 3600 - now.minute * 60 - now.second
-    return max(60.0, float(delta_seconds))
+        delta = (24 - now.hour + target_hour) * 3600 - now.minute * 60 - now.second
+    return max(60.0, float(delta))
