@@ -292,7 +292,69 @@ Claw" — fintech-grade augmented intelligence, not a chatbot bolted onto a char
 
 ---
 
-## 6. ONE LAST GUARDRAIL FOR THE SESSION
+## 6. APPENDIX — EPISODIC MEMORY SCHEMA REFERENCE (Bucket C)
+
+A second AI tool (Z.ai) was given a similar prompt for comparison. Most of its output
+duplicated the v8-porting trap at larger scale (re-importing cosmetic Pine display
+settings into a Python config registry, two internally-inconsistent confidence-weight
+schemes, and at least one line of invalid Python syntax in its "ChainEngine" code —
+worth knowing in case that document surfaces again). It is NOT being attached as
+reference material for that reason.
+
+One piece is worth keeping as a starting schema reference for the `memory/trade_store.py`
+module (Bucket C — design from scratch, but no need to design the column list from zero):
+
+```sql
+-- Reference schema for episodic trade memory (SQLite, per-asset or unified table)
+-- Treat as a STARTING POINT, not gospel — verify column types/names against
+-- whatever EpisodeStream/Position dataclasses get designed in Step 2.
+
+CREATE TABLE trades (
+    id TEXT PRIMARY KEY,              -- e.g. "ATM-YYYYMMDD-HHMM-DIR-N"
+    symbol TEXT,
+    broker TEXT,                      -- "deriv" | "bybit" | "mt5"
+    direction INTEGER,                -- 1 = long, -1 = short
+    entry_price REAL,
+    exit_price REAL,
+    sl_price REAL,
+    tp1_price REAL,
+    tp2_price REAL,
+    tp3_price REAL,
+    position_size REAL,
+    risk_per_trade REAL,
+    signal_type TEXT,                 -- which SignalCandidate type fired
+    confidence REAL,                  -- 0.0-1.0 at entry
+    restrictions TEXT,                -- JSON array, e.g. ["TP1_ONLY"]
+    risk_modifier REAL,
+    verdict TEXT,                     -- the ChainVerdict label
+    causal_trace TEXT,                -- JSON array of chain links (the "story")
+    outcome TEXT,                     -- "TP1"|"TP2"|"TP3"|"SL"|"TRAIL_EXIT"|"REVERSED"
+    realized_pnl REAL,
+    net_pips REAL,                    -- signed
+    max_favorable_pips REAL,          -- for MFE/MAE labeling (learning/ module)
+    entry_time DATETIME,
+    exit_time DATETIME,
+    bars_held INTEGER,
+    session_at_entry TEXT,            -- "LDN"|"NY"|"ASIA"
+    regime_at_entry TEXT,             -- "trending"|"ranging"|"volatile"
+    sl_autopsy TEXT                   -- narrative on SL hit, if any
+);
+
+-- Suggested query shape (pattern_matcher.py):
+-- "Given direction, verdict, confidence, regime -> what happened the last N
+--  times we saw this combination?" Returns outcome distribution, not a
+--  single number — this is what feeds the distributional model later.
+```
+
+This maps directly onto the feature-store/outcome-labeler work already discussed for
+the `learning/` module (MFE/MAE in R-multiples, shadow-tracking blocked signals).
+The `restrictions`, `causal_trace`, and `verdict` columns are what make this an
+*episodic* memory rather than just a trade log — they preserve the *reasoning*, not
+just the outcome.
+
+---
+
+## 7. ONE LAST GUARDRAIL FOR THE SESSION
 
 If at any point Claude Code's proposed code reintroduces:
 - a boolean signal flag written by more than one source into shared state,
