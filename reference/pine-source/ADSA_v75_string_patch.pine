@@ -1,0 +1,603 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// ADSA v7.5 — STRING INTELLIGENCE PATCH
+// Absolute Dollar Agent — Language, Narrative & Telegram Rebuild
+// ══════════════════════════════════════════════════════════════════════════════
+// This file contains DROP-IN REPLACEMENTS for three sections of ADSA v7.0.
+// Zero changes to signal mechanics, risk model, or TradeSgnl channels.
+// Only the agent's language, narrative logic, and message format change.
+//
+// WHAT IS REPLACED:
+//   Section 20 : tree_narrative block → chain_narrative (chain logic, not data dump)
+//                ai_advice string     → f_ai_advice_v2() (live-assembled, not static)
+//   Section 25 : _build_sl_autopsy() → rewritten with correct priority + honest language
+//   Section 26 : All event_commentary strings → chain-first, conclusion-second
+//                War Room Telegram    → compact ~12 lines (was ~35 lines)
+//                Public channel       → 3-4 lines max (was ~20 lines)
+//
+// HOW TO APPLY:
+//   STEP 1 — Insert PART 1 helper functions directly before line 1817
+//             (before the old "TREE NARRATIVE BUILDER" comment in Section 20)
+//   STEP 2 — Replace lines 1820–1838 (tree_narrative block + _tree_row function)
+//             with PART 2A (chain_narrative block)
+//   STEP 3 — Replace lines 1809–1815 (ai_advice static string)
+//             with PART 2B (f_ai_advice_v2 call)
+//   STEP 4 — Replace lines 2215–2229 (_build_sl_autopsy function)
+//             with PART 3
+//   STEP 5 — Replace lines 2254–2437 (all event_commentary + prem + pub builders)
+//             with PART 4
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 1 — HELPER FUNCTIONS
+// Insert before line 1817 (before old "TREE NARRATIVE BUILDER" comment)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Trail direction as single arrow
+f_arrow(int state) =>
+    state == 1 ? "↑" : state == -1 ? "↓" : "→"
+
+// Score with explicit sign
+f_score_str(float sc) =>
+    sc > 0 ? "+" + str.tostring(sc, "#.#") : str.tostring(sc, "#.#")
+
+// Count how many of the 4 fractal layers agree with a given direction
+f_layers_count(int direction) =>
+    int n = 0
+    if sovereign_state == direction
+        n += 1
+    if anchor_state == direction
+        n += 1
+    if filter_state == direction
+        n += 1
+    if exec_state == direction
+        n += 1
+    n
+
+// Compact 4-layer trail summary: e.g. "D↓ 15↑ 5↑ 1↑"
+f_layer_line() =>
+    "D"  + f_arrow(sovereign_state) + " " +
+    anchor_tf + "m" + f_arrow(anchor_state) + " " +
+    filter_tf + "m" + f_arrow(filter_state) + " " +
+    timeframe.period + "m" + f_arrow(exec_state)
+
+// Regime/VWAP/Fib state to single char
+f_state_short(string s) =>
+    s == "Long" or s == "Bull" ? "L" : s == "Short" or s == "Bear" ? "S" : "N"
+
+// Score alignment word
+f_score_word(float sc) =>
+    float a = math.abs(sc)
+    a >= 10 ? "Strong"   :
+    a >= 6  ? "Majority" :
+    a >= 3  ? "Partial"  :
+    a > 0   ? "Weak"     : "Mixed"
+
+// ATR context — one line
+f_atr_ctx() =>
+    string ap = str.tostring(_pips(atrN), "#.#")
+    atrHL == "High" ? "ATR HIGH (" + ap + "p) · volatile"    :
+    atrHL == "Low"  ? "ATR LOW ("  + ap + "p) · choppy range" :
+                      "ATR MED ("  + ap + "p)"
+
+// Session abbreviation
+f_session_short() =>
+    str.contains(current_session, "NY")     ? "NY"  :
+    str.contains(current_session, "LONDON") ? "LDN" :
+    str.contains(current_session, "TOKYO")  ? "TKO" : "OTC"
+
+// Liquidity context — one line, includes POC if available
+f_liq_ctx() =>
+    string poc_str = vpEnabled and not na(vp_currentPOC) ? "POC " + _p(vp_currentPOC) + " · " : ""
+    poc_str + "Buy-liq " + _p(ph_top) + " · Sell-liq " + _p(pl_btm)
+
+// Synthesis conclusion for a given trade direction (used in chain narrative + entry msg)
+f_chain_synthesis(int direction) =>
+    int   n  = f_layers_count(direction)
+    bool  ct = (direction == 1 and sovereign_state == -1) or
+               (direction == -1 and sovereign_state == 1)
+    string dw = direction == 1 ? "long" : "short"
+    if n == 4
+        "→ Full 4-layer alignment " + dw + ". Trail consensus across all TFs."
+    else if n == 3 and ct
+        "→ Local " + dw + " · 3/4 TF. D opposing — counter-trend. TP1 focus."
+    else if n == 3
+        "→ 3/4 layers aligned " + dw + ". One TF dissenting — watch for convergence."
+    else if n == 2
+        "→ Partial alignment (2/4). Exec fired but navigator/anchor not fully on board."
+    else
+        "→ Weak trail consensus. " + f_layer_line() + ". Exec signal only."
+
+// Bar timestamp (UTC)
+f_ts() =>
+    str.format_time(time, "HH:mm", "UTC+0") + " UTC"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 2A — CHAIN NARRATIVE
+// Replace lines 1820–1838 (old _tree_row function + tree_narrative block)
+// ══════════════════════════════════════════════════════════════════════════════
+// The chain narrative shows the SAME 5-TF data as the old tree, but:
+//   — Trail direction (↑↓→) is shown per layer where available from fractal sync
+//   — Indicator states are condensed to single chars (L/S/N) to save space
+//   — A synthesis line at the bottom tells the trader what it all means together
+//   — M15 and M5 rows are annotated with their roles (Navigator / Exec layer)
+//   — D veto is flagged inline when sovereign opposes exec direction
+//
+// Variable name kept as "tree_narrative" so all downstream references work unchanged.
+
+tree_narrative =
+     "D  " + f_arrow(sovereign_state) + " " +
+     (sov_score>=2.5?"🟢":sov_score<=-2.5?"🔴":sov_score>0?"🟡":sov_score<0?"🟠":"⚪") +
+     "  R:" + f_state_short(sov_r) + " V:" + f_state_short(sov_v) +
+     " F:" + f_state_short(sov_f) + " RSI:" + sov_ri +
+     "  " + f_score_str(sov_score) +
+     ((sovereign_state==-1 and exec_state==1) or (sovereign_state==1 and exec_state==-1)
+      ? "  [VETO]" : "  ← Sovereign") + "\n" +
+     "H4    " +
+     (h4_score>=2.5?"🟢":h4_score<=-2.5?"🔴":h4_score>0?"🟡":h4_score<0?"🟠":"⚪") +
+     "  R:" + f_state_short(h4_r) + " V:" + f_state_short(h4_v) +
+     " F:" + f_state_short(h4_f) + " RSI:" + h4_ri +
+     "  " + f_score_str(h4_score) + "\n" +
+     "H1    " +
+     (h1_score>=2.5?"🟢":h1_score<=-2.5?"🔴":h1_score>0?"🟡":h1_score<0?"🟠":"⚪") +
+     "  R:" + f_state_short(h1_r) + " V:" + f_state_short(h1_v) +
+     " F:" + f_state_short(h1_f) + " RSI:" + h1_ri +
+     "  " + f_score_str(h1_score) + "  ← Session bias\n" +
+     "M15 " + f_arrow(anchor_state) + " " +
+     (m15_score>=2.5?"🟢":m15_score<=-2.5?"🔴":m15_score>0?"🟡":m15_score<0?"🟠":"⚪") +
+     "  R:" + f_state_short(m15_r) + " V:" + f_state_short(m15_v) +
+     " F:" + f_state_short(m15_f) + " RSI:" + m15_ri +
+     "  " + f_score_str(m15_score) + "  ← Navigator\n" +
+     "M5  " + f_arrow(filter_state) + " " +
+     (m5_score>=2.5?"🟢":m5_score<=-2.5?"🔴":m5_score>0?"🟡":m5_score<0?"🟠":"⚪") +
+     "  R:" + f_state_short(m5_r) + " V:" + f_state_short(m5_v) +
+     " F:" + f_state_short(m5_f) + " RSI:" + m5_ri +
+     "  " + f_score_str(m5_score) + "  ← Exec layer\n" +
+     "──── " + str.tostring(total_score,"#.#") + "/15 · " +
+     f_score_word(total_score) + " · " + f_layer_line() + " ────\n" +
+     f_chain_synthesis(exec_state)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 2B — AI ADVICE REPLACEMENT
+// Replace lines 1809–1815 (old static ai_advice lookup table)
+// ══════════════════════════════════════════════════════════════════════════════
+// Old: score threshold lookup → one of 7 static phrases
+// New: assembled from 4 live values → unique sentence every signal
+//
+// Outputs: "[score_word] alignment (N/15) · [sov relation] · [ATR state] · [liq note] · [PDH/PDL]"
+// Example: "Majority alignment (8/15) · against D trail · ATR MED (12.4p) · Sell-liq 1.08040 below · Inside daily range"
+
+f_ai_advice_v2(int direction) =>
+    string sov_rel  = sovereign_state == direction  ? "with D trail"    :
+                      sovereign_state == 0          ? "D trail flat"    : "against D trail"
+    string liq_note = direction == 1 and not na(ph_top) ?
+                      "Buy-liq " + _p(ph_top) + " above"  :
+                      direction == -1 and not na(pl_btm) ?
+                      "Sell-liq " + _p(pl_btm) + " below" : ""
+    f_score_word(total_score) + " alignment (" +
+    str.tostring(math.abs(total_score), "#.#") + "/15)" +
+    " · " + sov_rel +
+    " · " + f_atr_ctx() +
+    (liq_note != "" ? " · " + liq_note : "") +
+    " · " + pdh_pdl_status
+
+// Drop-in: replaces the old ai_advice definition
+string ai_advice = f_ai_advice_v2(exec_state)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 3 — SL AUTOPSY v2
+// Replace lines 2215–2229 (old _build_sl_autopsy function)
+// ══════════════════════════════════════════════════════════════════════════════
+// Key changes from v7.0:
+//   — Priority order corrected: counter-trend FIRST (most common structural cause),
+//     then liq sweep, then ATR, then weak score, then honest unknown
+//   — "Institutions swept our stop" removed — code doesn't detect intent
+//   — Rules removed that contradict what the agent actually does
+//   — Default case is now honest: "no pattern identified" with actual data appended
+//   — ATR check notes the SL buffer used, not just the state
+
+_build_sl_autopsy() =>
+    string out = ""
+
+    // Priority 1: Counter-trend — sovereign was opposing at entry time
+    // Most common cause of limited runway. The exec TF confirmed but macro reasserted.
+    if (sovereign_state == -1 and trade_direction == 1) or
+       (sovereign_state == 1  and trade_direction == -1)
+        string sov_dir   = sovereign_state == -1 ? "BEARISH" : "BULLISH"
+        string trade_dir = trade_direction  == 1 ? "long"    : "short"
+        out := "COUNTER-TREND: D trail was " + sov_dir + " at entry.\n" +
+               trade_dir + " entered against sovereign structure.\n" +
+               "Exec TF confirmed — macro structure reasserted before target.\n" +
+               "Score at entry: " + str.tostring(total_score,"#.#") + "/15 · Peak: " +
+               str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "."
+
+    // Priority 2: Stop placed at/near a liquidity pool that was swept
+    // liq_bias uses string matching on pool proximity — honest description
+    else if str.contains(liq_bias,"BREAKING")
+        string swept = str.contains(liq_bias,"HIGH") ? "buy-side" : "sell-side"
+        out := "LIQ ZONE SWEEP: Stop was at/near the " + swept + " pool.\n" +
+               "Price swept beyond the pool before reversing.\n" +
+               "SL buffer (" + str.tostring(sl_buffer_atr,"#.#") + " ATR) did not clear the sweep depth.\n" +
+               "Consider placing SL beyond the zone rather than at it."
+
+    // Priority 3: ATR Low state (tight conditions, SL prone to noise)
+    // Note: this reflects conditions at STOP TIME, which is a proxy for entry conditions
+    else if atrHL == "Low"
+        out := "LOW ATR: Volatility was compressed at stop time.\n" +
+               "ATR: " + str.tostring(atrN,"#.#####") + " · SL distance was " +
+               _pip_str(locked_risk_dist) + " (" +
+               str.tostring(sl_buffer_atr,"#.#") + " ATR buffer).\n" +
+               "In low-ATR conditions, small noise moves can clip stops.\n" +
+               "Widening SL buffer or reducing size reduces this risk."
+
+    // Priority 4: Weak alignment at entry (score below meaningful threshold)
+    else if math.abs(total_score) < 4
+        float agree_tfs = math.round((math.abs(total_score) / 3.0))
+        out := "WEAK ALIGNMENT: Score " + str.tostring(total_score,"#.#") + "/15 at entry.\n" +
+               "Approximately " + str.tostring(agree_tfs,"#") + "/5 TF layers agreed.\n" +
+               "Partial alignment entries carry higher invalidation risk.\n" +
+               "Exec TF fired but higher TFs had not confirmed direction."
+
+    // Default: honest — no dominant pattern identified from available data
+    else
+        out := "NO DOMINANT PATTERN: Trade structure was valid at entry.\n" +
+               "Score: " + str.tostring(total_score,"#.#") + "/15 · ATR: " + atrHL +
+               " · Session: " + current_session + "\n" +
+               "Peak before stop: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + ".\n" +
+               "Logged for pattern accumulation. No parameter change recommended."
+    out
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 4 — BROADCAST ENGINE REPLACEMENT
+// Replace lines 2254–2437 (all event_commentary + prem + pub builders)
+// The trigger_signal condition, silence_broadcast, and the outer
+// "if useAgentAlerts and barstate.isconfirmed" block remain unchanged.
+// Replace ONLY the inner content that builds event_title, event_commentary, prem, pub.
+// ══════════════════════════════════════════════════════════════════════════════
+// Design principles for new messages:
+//   WAR ROOM  — chain-first (what happened → what it means → levels → context → advice)
+//             — max ~14 lines for entry, ~8 for TP/SL, ~9 for session open
+//             — all data preserved, separators reduced to 2 (header + context break)
+//   PUBLIC    — 3–4 lines max, every event type
+//             — no raw levels (sanitize = true by default), just direction + context tag
+//             — clear CTA to War Room
+// ══════════════════════════════════════════════════════════════════════════════
+
+    string sl_autopsy   = _build_sl_autopsy()
+    string _sym         = syminfo.ticker + " | " + timeframe.period
+    string _ts          = f_ts()
+    string _sep         = "──────────────────────────"
+    string _ticker_line = syminfo.ticker + " " + timeframe.period + " · " + _ts
+
+    string event_title       = ""
+    string event_commentary  = ""
+
+    // ── SILENCE BROADCAST ────────────────────────────────────────────────────
+    if silence_broadcast
+        event_title      := "🔇 STANDING ASIDE"
+        event_commentary :=
+             (atrHL == "Low" ?
+              "ATR LOW — compressed range. No setups until volatility expands.\n" +
+              "ATR: " + str.tostring(atrN,"#.#####") + " vs 20-bar avg." :
+              math.abs(total_score) < 3 ?
+              "Score " + str.tostring(total_score,"#.#") + "/15 — no dominant bias.\n" +
+              f_layer_line() + " — mixed trail state." :
+              "Operator silence active. Score: " + str.tostring(total_score,"#.#") + "/15.\n" +
+              f_layer_line() + " · " + pdh_pdl_status + ".") +
+             (admin_commentary != "" ? "\nNote: " + admin_commentary : "")
+
+    // ── STOP LOSS HIT ────────────────────────────────────────────────────────
+    else if sl_alert_event
+        event_title      := "💀 SL HIT"
+        event_commentary :=
+             str.tostring(math.abs(_pips(locked_risk_dist)),"#.##") + " " + pip_unit +
+             " · −$" + str.tostring(locked_actual_risk,"#.##") +
+             " · ID " + atm_trade_id + "\n" +
+             "Peak before stop: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit +
+             " · Score at entry: " + str.tostring(total_score,"#.#") + "/15\n" +
+             _sep + "\n" +
+             sl_autopsy
+
+    // ── HOLDER MODE EXIT ─────────────────────────────────────────────────────
+    else if holder_exit_event
+        event_title      := "🏁 HOLDER EXIT"
+        string dir_word   = trade_direction == 1 ? "Long" : "Short"
+        event_commentary :=
+             dir_word + " · VWAP trail crossed at " + _p(vap_current) + "\n" +
+             "Swing leg complete. Peak run: " +
+             str.tostring(max_profit_pips,"#.##") + " " + pip_unit + ".\n" +
+             "Remaining position closed. Trade concluded."
+
+    // ── TP3 HIT ──────────────────────────────────────────────────────────────
+    else if tp3_alert_event
+        event_title      := "🚀 TP3 HIT (2:1)"
+        event_commentary :=
+             "+" + str.tostring(_pips(math.abs(locked_tp3-locked_entry)),"#.##") + " " + pip_unit +
+             " · 2:1 · ID " + atm_trade_id + "\n" +
+             "75% closed at " + _p(locked_tp3) + ".\n" +
+             "Holder mode: trailing 25% via VWAP at " + _p(vap_current) + ".\n" +
+             "Exit fires on VWAP cross-back."
+
+    // ── TP2 HIT ──────────────────────────────────────────────────────────────
+    else if tp2_alert_event
+        event_title      := "🎯🎯 TP2 HIT (1.5:1)"
+        event_commentary :=
+             "+" + str.tostring(_pips(math.abs(locked_tp2-locked_entry)),"#.##") + " " + pip_unit +
+             " · 1.5:1 · ID " + atm_trade_id + "\n" +
+             "50% off at " + _p(locked_tp2) + ".\n" +
+             "SL → entry: " + _p(locked_entry) + ". Position now risk-free.\n" +
+             "Next: TP3 at " + _p(locked_tp3) + " (+" +
+             str.tostring(_pips(math.abs(locked_tp3-locked_entry)),"#.##") + "p · 2:1)."
+
+    // ── TP1 HIT ──────────────────────────────────────────────────────────────
+    else if tp1_alert_event
+        event_title      := "🎯 TP1 HIT (1:1)"
+        event_commentary :=
+             "+" + str.tostring(_pips(math.abs(locked_tp1-locked_entry)),"#.##") + " " + pip_unit +
+             " · 1:1 · ID " + atm_trade_id + "\n" +
+             "25–33% off at " + _p(locked_tp1) + ".\n" +
+             "Tighten SL toward entry. Next: TP2 at " + _p(locked_tp2) + " (+" +
+             str.tostring(_pips(math.abs(locked_tp2-locked_entry)),"#.##") + "p · 1.5:1)."
+
+    // ── REGIME REJECTION ─────────────────────────────────────────────────────
+    // Shows WHICH specific gate failed, not a generic "misaligned" message
+    else if rejection_alert
+        event_title      := "⛔ BLOCKED"
+        bool  is_long     = buy_rejected
+        string dir_word   = is_long ? "LONG" : "SHORT"
+        string rsi_val_s  = str.tostring(rsi, "#.#")
+        bool  rsi_fail    = is_long ? not (rsi > pmom) : not (rsi < nmom)
+        bool  vwap_fail   = is_long ? not vwapBullish  : not vwapBearish
+        string rsi_note   = rsi_fail ?
+             "RSI " + rsi_val_s + (is_long ? " < " + str.tostring(pmom,"#") + " (bull threshold)" :
+                                             " > " + str.tostring(nmom,"#") + " (bear threshold)") : ""
+        string vwap_note  = vwap_fail ?
+             "VWAP: price " + (is_long ? "below" : "above") + " " + _p(vap_current) : ""
+        string failed     = rsi_fail and vwap_fail ? rsi_note + " · " + vwap_note :
+                            rsi_fail                ? rsi_note  : vwap_note
+        string needs      = rsi_fail and vwap_fail ?
+             "RSI " + (is_long ? "> " + str.tostring(pmom,"#") : "< " + str.tostring(nmom,"#")) +
+             " AND price " + (is_long ? "above" : "below") + " VWAP" :
+             rsi_fail ? "RSI " + (is_long ? "> " + str.tostring(pmom,"#") : "< " + str.tostring(nmom,"#")) :
+             "Price " + (is_long ? "above" : "below") + " VWAP " + _p(vap_current)
+        event_commentary :=
+             "Trail flipped " + dir_word + " — regime gate rejected.\n" +
+             "Failed: " + failed + "\n" +
+             "Needs: " + needs + " to clear.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Sovereign: " + sovereignStatus
+
+    // ── BUY SIGNAL ───────────────────────────────────────────────────────────
+    else if buy_signal_confirmed
+        string sync_tag = master_sync_buy       ? "🔥 MASTER SYNC LONG"     :
+                          sovereign_counter_buy  ? "⚠️ COUNTER-TREND LONG" :
+                                                   "🟢 LONG"
+        event_title := sync_tag
+        int  n_agree = f_layers_count(1)
+        string chain_line =
+             f_layer_line() + " · " + str.tostring(n_agree,"#") + "/4 layers · Score " +
+             str.tostring(total_score,"#.#") + "/15 · " + f_session_short() + " · " + pdh_pdl_status
+        string sov_note   = sovereign_state == -1 ?
+             "D trail BEAR · " + str.tostring(n_agree,"#") + "/4 TF aligned · Counter-trend." :
+             sovereign_state == 1 ?
+             "D trail BULL · Sovereign confirmed." : "D trail flat · Local exec signal."
+        event_commentary :=
+             "Exec trail ↑ at " + _p(locked_entry) +
+             " · ATR trail: " + _pip_str(nLoss_buy) + " · " + f_atr_ctx() + "\n" +
+             chain_line + "\n" +
+             sov_note + "\n" +
+             f_ai_advice_v2(1)
+
+    // ── SELL SIGNAL ──────────────────────────────────────────────────────────
+    else if sell_signal_confirmed
+        string sync_tag = master_sync_sell      ? "🥶 MASTER SYNC SHORT"    :
+                          sovereign_counter_sell ? "⚠️ COUNTER-TREND SHORT" :
+                                                   "🔴 SHORT"
+        event_title := sync_tag
+        int  n_agree = f_layers_count(-1)
+        string chain_line =
+             f_layer_line() + " · " + str.tostring(n_agree,"#") + "/4 layers · Score " +
+             str.tostring(total_score,"#.#") + "/15 · " + f_session_short() + " · " + pdh_pdl_status
+        string sov_note   = sovereign_state == 1 ?
+             "D trail BULL · " + str.tostring(n_agree,"#") + "/4 TF aligned · Counter-trend." :
+             sovereign_state == -1 ?
+             "D trail BEAR · Sovereign confirmed." : "D trail flat · Local exec signal."
+        event_commentary :=
+             "Exec trail ↓ at " + _p(locked_entry) +
+             " · ATR trail: " + _pip_str(nLoss_sell) + " · " + f_atr_ctx() + "\n" +
+             chain_line + "\n" +
+             sov_note + "\n" +
+             f_ai_advice_v2(-1)
+
+    // ── LIQUIDITY SWEEPS ─────────────────────────────────────────────────────
+    // Honest framing: we know a sweep happened, we don't know why
+    // Score lean used to assign a probability lean to false-break vs continuation
+    else if alert_liq_buy_sweep
+        event_title      := "⚡ BUY-SIDE LIQ SWEPT"
+        string score_lean = total_score < -2 ? "Bearish score lean → false-break probability elevated." :
+                            total_score > 2  ? "Bullish score lean → breakout continuation possible."   :
+                                               "Neutral score — no lean. Outcome open."
+        event_commentary :=
+             "Pool at " + _p(ph_top) + " swept.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Structure: " +
+             (swingTrend.bias==BULLISH?"Bullish swing":"Bearish swing") + "\n" +
+             score_lean + "\n" +
+             "Wait for exec trail confirmation before positioning. Do not react to sweep alone."
+
+    else if alert_liq_sell_sweep
+        event_title      := "⚡ SELL-SIDE LIQ SWEPT"
+        string score_lean = total_score > 2  ? "Bullish score lean → false-break probability elevated." :
+                            total_score < -2 ? "Bearish score lean → breakdown continuation possible."  :
+                                               "Neutral score — no lean. Outcome open."
+        event_commentary :=
+             "Pool at " + _p(pl_btm) + " swept.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Structure: " +
+             (swingTrend.bias==BULLISH?"Bullish swing":"Bearish swing") + "\n" +
+             score_lean + "\n" +
+             "Wait for exec trail confirmation before positioning. Do not react to sweep alone."
+
+    // ── STRUCTURE SHIFTS (BOS / CHoCH) ───────────────────────────────────────
+    // Honest: this is a context update, not an entry signal
+    else if currentAlerts.swingBullishBOS or currentAlerts.swingBullishCHoCH
+        string struct_type = currentAlerts.swingBullishBOS ? "BOS" : "CHoCH"
+        event_title        := "📈 BULL STRUCTURE SHIFT (" + struct_type + ")"
+        event_commentary   :=
+             "Swing " + struct_type + " confirmed bullish.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Liq: " + liq_bias + "\n" +
+             "Context update — not an entry signal.\n" +
+             "Exec trail flip required to generate a trade signal."
+
+    else if currentAlerts.swingBearishBOS or currentAlerts.swingBearishCHoCH
+        string struct_type = currentAlerts.swingBearishBOS ? "BOS" : "CHoCH"
+        event_title        := "📉 BEAR STRUCTURE SHIFT (" + struct_type + ")"
+        event_commentary   :=
+             "Swing " + struct_type + " confirmed bearish.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Liq: " + liq_bias + "\n" +
+             "Context update — not an entry signal.\n" +
+             "Exec trail flip required to generate a trade signal."
+
+    // ── SESSION OPEN ─────────────────────────────────────────────────────────
+    // The most valuable broadcast of the session — full snapshot + agenda
+    else if vp_newSession
+        event_title := "🕒 " + f_session_short() + " SESSION OPEN"
+        string open_ctx = atrHL == "Low" ?
+             "ATR LOW — compressed range. Higher noise, tighter stops at risk. Wait for expansion." :
+             math.abs(total_score) < 3 ?
+             "Score " + str.tostring(total_score,"#.#") + "/15 — mixed alignment. No dominant bias yet." :
+             total_score >= 3 ?
+             "Score " + str.tostring(total_score,"#.#") + "/15 — bullish lean. Watch M5 trail for long entries." :
+             "Score " + str.tostring(total_score,"#.#") + "/15 — bearish lean. Watch M5 trail for short entries."
+        string poc_ctx  = vpEnabled and not na(vp_currentPOC) ?
+             "POC " + _p(vp_currentPOC) + " · VAH " +
+             _p(array.get(vp_vaLevels,1)) + " · VAL " + _p(array.get(vp_vaLevels,0)) :
+             "VP not computed yet."
+        string agenda   = total_score < -2 and sovereign_state == -1 ?
+             "Bearish setup favoured. Sell-liq " + _p(pl_btm) + " as first magnet. Watch M5 trail ↓." :
+             total_score > 2  and sovereign_state == 1  ?
+             "Bullish setup favoured. Buy-liq "  + _p(ph_top) + " as first magnet. Watch M5 trail ↑." :
+             "Mixed conditions at open. Waiting for score and trail to align before positioning."
+        event_commentary :=
+             current_session + " · " + pdh_pdl_status + "\n" +
+             "ATR " + f_atr_ctx() + " · D " + f_arrow(sovereign_state) +
+             " · Score " + str.tostring(total_score,"#.#") + "/15\n" +
+             poc_ctx + "\n" +
+             "Buy-liq " + _p(ph_top) + " · Sell-liq " + _p(pl_btm) + "\n" +
+             open_ctx + "\n" +
+             "→ " + agenda
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // TRADE PARAMETERS BLOCK (entry signals only)
+    // Compact layout — all info preserved, one line per level
+    // ══════════════════════════════════════════════════════════════════════════
+    string _tparams = ""
+    if (buy_signal_confirmed or sell_signal_confirmed) and not na(locked_tp1)
+        _tparams :=
+             _sep + "\n" +
+             "Entry  " + _p(locked_entry) +
+             "    SL " + _p(locked_sl) +
+             " (" + _pip_str(locked_risk_dist) + " · $" + str.tostring(risk_per_trade,"#.##") + ")\n" +
+             "TP1    " + _p(locked_tp1) +
+             " (+" + _pip_str(math.abs(locked_tp1-locked_entry)) + " · 1:1)\n" +
+             "TP2    " + _p(locked_tp2) +
+             " (+" + _pip_str(math.abs(locked_tp2-locked_entry)) + " · 1.5:1)\n" +
+             "TP3    " + _p(locked_tp3) +
+             " (+" + _pip_str(math.abs(locked_tp3-locked_entry)) + " · 2:1)\n" +
+             "Size   " + _size_display(locked_position_size) +
+             " · ID " + atm_trade_id + "\n"
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // WAR ROOM MESSAGE (Premium / Full Glass Box)
+    // Format: signal header + chain commentary + trade levels + context + synthesis
+    // Target: ~12 lines for entry, ~8 for TP/SL, ~9 for session open
+    // ══════════════════════════════════════════════════════════════════════════
+    string prem = ""
+
+    // Header: signal type + asset + timestamp (one line)
+    prem += event_title + " · " + _ticker_line + "\n"
+    prem += _sep + "\n"
+
+    // Chain commentary (what triggered, what context means)
+    prem += event_commentary + "\n"
+
+    // Trade levels (entry signals only)
+    if _tparams != ""
+        prem += _tparams
+
+    // Context block: score tree + liq levels + synthesis
+    // Only append full context on entry signals and session open
+    // TP/SL/rejection messages are intentionally lean
+    bool show_full_ctx = buy_signal_confirmed or sell_signal_confirmed or vp_newSession
+    if show_full_ctx
+        prem += _sep + "\n"
+        prem += f_liq_ctx() + "\n"
+        prem += f_chain_synthesis(exec_state) + "\n"
+
+    // Admin commentary (always appended if set)
+    if admin_commentary != ""
+        prem += "Note: " + admin_commentary + "\n"
+
+    // Asset context note (if set)
+    if asset_context != ""
+        prem += "📌 " + asset_context + "\n"
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PUBLIC CHANNEL MESSAGE (Sanitized)
+    // 3–4 lines max per event. Direction + context tag + CTA to War Room.
+    // ══════════════════════════════════════════════════════════════════════════
+    string pub = ""
+
+    if tg_public_sanitize
+        // Line 1: event type + asset (always)
+        pub += event_title + " · " + syminfo.ticker + " " + timeframe.period + "\n"
+
+        // Line 2: context summary (event-specific, lean)
+        if silence_broadcast
+            pub += "Operator silence — standing aside.\n"
+        else if sl_alert_event
+            pub += "Loss absorbed · Glass Box autopsy logged.\n"
+        else if tp3_alert_event
+            pub += "2:1 full run complete.\n"
+        else if tp2_alert_event
+            pub += "1.5:1 secured · SL to breakeven.\n"
+        else if tp1_alert_event
+            pub += "1:1 partial secured · trade ongoing.\n"
+        else if buy_signal_confirmed or sell_signal_confirmed
+            string dir_str  = buy_signal_confirmed ? "Long" : "Short"
+            string tag      = master_sync_buy or master_sync_sell       ? "4/4 TF aligned" :
+                              sovereign_counter_buy or sovereign_counter_sell ? "counter-trend · D opposing" :
+                              str.tostring(f_layers_count(buy_signal_confirmed?1:-1),"#") + "/4 TF aligned"
+            pub += dir_str + " · Score " + str.tostring(total_score,"#.#") + "/15 · " + tag + "\n"
+        else if alert_liq_buy_sweep or alert_liq_sell_sweep
+            pub += (alert_liq_buy_sweep ? "Buy-side" : "Sell-side") +
+                   " liq swept. Monitoring for exec trail signal.\n"
+        else if currentAlerts.swingBullishBOS or currentAlerts.swingBullishCHoCH or
+                currentAlerts.swingBearishBOS or currentAlerts.swingBearishCHoCH
+            pub += "Structure shift. Context updated — waiting for exec trail.\n"
+        else if vp_newSession
+            pub += current_session + " · Score " + str.tostring(total_score,"#.#") +
+                   "/15 · " + pdh_pdl_status + "\n"
+
+        // Line 3: PDH/PDL always shown (key intraday context)
+        pub += pdh_pdl_status + "\n"
+
+        // Line 4: CTA
+        pub += "→ Full Glass Box in War Room."
+
+    // Keep existing else branch for non-sanitized public (full event_commentary)
+    else
+        pub += _sep + "\n🤖 ABSOLUTE DOLLAR — ATM AGENT\n" + _sep + "\n"
+        pub += "📊 " + _sym + " · " + _ts + "\n"
+        pub += "🔔 " + event_title + "\n" + _sep + "\n"
+        pub += event_commentary + "\n"
+        if _tparams != ""
+            pub += _tparams
+        pub += "Score: " + str.tostring(total_score,"#.#") + "/15 · " + effective_bias + "\n"
+        pub += pdh_pdl_status + " · " + f_liq_ctx() + "\n"
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ALERT DISPATCH (unchanged from v7.0)
+    // Telegram alerts are sent via the same alert() calls as before.
+    // Just pass prem to War Room and pub to Public — same wiring, new content.
+    // ══════════════════════════════════════════════════════════════════════════
+    if tg_1_active
+        alert(prem, alert.freq_once_per_bar_close)
+    if tg_2_active
+        alert(pub,  alert.freq_once_per_bar_close)

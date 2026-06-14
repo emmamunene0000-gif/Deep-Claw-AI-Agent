@@ -1,0 +1,479 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// ADSA v7.5 — EPISODIC MEMORY & REAL PERFORMANCE PATCH
+// ══════════════════════════════════════════════════════════════════════════════
+// Companion to ADSA_v75_string_patch.pine
+// Adds session memory, live self-assessment, and real dashboard intelligence.
+//
+// KEY INSIGHT: V7 already has episodic memory (dpt_* arrays track every signal,
+// its type, score, and outcome). The problem is nothing reads them for narrative.
+// This patch builds reading functions over the existing arrays and wires them
+// into entry commentary and the dashboard — no new data collection needed.
+//
+// WHAT THIS ADDS:
+//   PART 5 — Session memory variables (score at open, score history)
+//             Insert before Section 22 (alongside dpt_* declarations, ~line 1920)
+//   PART 6 — Memory reading functions
+//             Insert before Section 23 (dashboard, ~line 2012)
+//   PART 7 — Dashboard additions
+//             Patch into Section 23 dashboard string builder (tradeSection area)
+//   PART 8 — Memory-enhanced entry commentary
+//             Updates to PART 4 in first patch: prepend f_signal_context() to
+//             buy/sell entry event_commentary blocks
+//
+// HOW TO APPLY:
+//   STEP 1 — Paste PART 5 after the dpt_* array declarations (~line 1939)
+//   STEP 2 — Paste PART 6 before Section 23 (~line 2012)
+//   STEP 3 — In Section 23 dashboard, find the "TODAY" block and add PART 7 after it
+//   STEP 4 — In PART 4 of the first patch (entry commentary for buy/sell signals),
+//             prepend f_signal_context() + "\n" to event_commentary
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 5 — SESSION MEMORY VARIABLES
+// Insert after dpt_* declarations (~line 1939), before the _new_trading_day block
+// ══════════════════════════════════════════════════════════════════════════════
+// These track state that the dpt_* arrays don't already cover:
+//   — score at session open (to show drift during session)
+//   — session-level signal index (resets each VP session, not each day)
+//     Note: dpt_* reset on _new_trading_day. Session resets on vp_newSession.
+//     A single day can have multiple VP sessions (London → NY). Session memory
+//     tracks context within the current active VP session.
+
+var float  mem_session_open_score = na     // total_score when vp_newSession fired
+var string mem_session_open_bias  = ""     // effective_bias at session open
+var int    mem_session_sig_count  = 0      // signals fired in THIS VP session (resets each session)
+var int    mem_session_sl_count   = 0      // SL hits in THIS VP session
+var int    mem_session_tp_count   = 0      // any TP hit in THIS VP session
+var int    mem_session_start_bar  = 0      // bar_index when session opened
+var string mem_session_label      = ""     // "LDN", "NY", "TKO"
+
+// Reset session memory on each new VP session
+if vp_newSession
+    mem_session_open_score := total_score
+    mem_session_open_bias  := effective_bias
+    mem_session_sig_count  := 0
+    mem_session_sl_count   := 0
+    mem_session_tp_count   := 0
+    mem_session_start_bar  := bar_index
+    mem_session_label      := str.contains(current_session,"NY")     ? "NY"  :
+                               str.contains(current_session,"LONDON") ? "LDN" : "TKO"
+
+// Update session memory on events
+if buy_signal_confirmed or sell_signal_confirmed
+    mem_session_sig_count := mem_session_sig_count + 1
+if sl_alert_event
+    mem_session_sl_count  := mem_session_sl_count + 1
+if tp1_alert_event or tp2_alert_event or tp3_alert_event
+    mem_session_tp_count  := mem_session_tp_count + 1
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 6 — MEMORY READING FUNCTIONS
+// Insert before Section 23 (dashboard, ~line 2012)
+// All functions read the existing dpt_* arrays — no new data collection.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── f_ep_result_str: compact outcome for a single dpt episode ──────────────
+// Returns "TP3", "TP2", "TP1", "SL", "OPEN", or "?"
+f_ep_result_str(int idx) =>
+    bool t1  = array.get(dpt_tp1_hit, idx)
+    bool t2  = array.get(dpt_tp2_hit, idx)
+    bool t3  = array.get(dpt_tp3_hit, idx)
+    bool sl  = array.get(dpt_sl_hit,  idx)
+    bool cur = idx == dpt_active_idx and trade_active
+    sl ? "SL" : t3 ? "TP3" : t2 ? "TP2" : t1 ? "TP1" : cur ? "OPEN" : "?"
+
+// ── f_session_log: compact episode log from dpt arrays ────────────────────
+// Example output: "1.L[S4]+11→TP2  2.S[CT]−3→SL  3.L[LO]+8→OPEN"
+// Shows every signal this trading day with direction, type, score, outcome.
+f_session_log() =>
+    int    n   = array.size(dpt_dir)
+    string log = ""
+    if n > 0
+        for i = 0 to n - 1
+            int    d    = array.get(dpt_dir,   i)
+            float  sc   = array.get(dpt_score, i)
+            string t    = array.get(dpt_type,  i)
+            string dir  = d == 1 ? "L" : "S"
+            string typ  = t == "SYNC4" ? "S4" : t == "COUNTER" ? "CT" : "LO"
+            string sc_s = sc > 0 ? "+" + str.tostring(sc,"#.#") : str.tostring(sc,"#.#")
+            string res  = f_ep_result_str(i)
+            log += str.tostring(i+1) + "." + dir + "[" + typ + "]" + sc_s + "→" + res + "  "
+    n == 0 ? "No signals yet today." : log
+
+// ── f_signal_context: session context for entry commentary ────────────────
+// Called at signal time — references dpt arrays BEFORE the new signal is pushed.
+// Returns: "Signal #3 this session · Prior: 1.L[S4]+11→TP2  2.S[CT]−3→SL"
+f_signal_context() =>
+    int n = array.size(dpt_dir)     // count BEFORE this signal is pushed
+    if n == 0
+        "First signal this session."
+    else
+        // Show last 2 prior signals max (keep Telegram message lean)
+        int    from_idx = math.max(0, n - 2)
+        string prior    = ""
+        for i = from_idx to n - 1
+            int    d   = array.get(dpt_dir,   i)
+            float  sc  = array.get(dpt_score, i)
+            string t   = array.get(dpt_type,  i)
+            string dir = d == 1 ? "L" : "S"
+            string typ = t == "SYNC4" ? "S4" : t == "COUNTER" ? "CT" : "LO"
+            string sc_s = sc > 0 ? "+" + str.tostring(sc,"#.#") : str.tostring(sc,"#.#")
+            string res  = f_ep_result_str(i)
+            prior += str.tostring(i+1) + "." + dir + "[" + typ + "]" + sc_s + "→" + res + "  "
+        "Signal #" + str.tostring(n+1) + " today · Prior: " + prior
+
+// ── f_score_momentum: how score has drifted since session open ─────────────
+// Returns "" if no session open recorded yet.
+// Example: "Score ↑ from −4 at LDN open (now +8 — structural shift)"
+f_score_momentum() =>
+    if na(mem_session_open_score)
+        ""
+    else
+        float drift = total_score - mem_session_open_score
+        string arrow = drift > 2 ? "↑" : drift < -2 ? "↓" : "→"
+        string mag   = math.abs(drift) > 6 ? " — structural shift" :
+                       math.abs(drift) > 3 ? " — bias strengthening" : ""
+        "Score " + arrow + " from " + str.tostring(mem_session_open_score,"#.#") +
+        " at " + mem_session_label + " open (now " +
+        str.tostring(total_score,"#.#") + mag + ")"
+
+// ── f_ct_summary: counter-trend signal performance from dpt arrays ─────────
+// Reads all signals tagged "COUNTER" and reports their outcomes honestly.
+f_ct_summary() =>
+    int n        = array.size(dpt_type)
+    int ct_total = 0
+    int ct_tp1   = 0
+    int ct_tp2   = 0
+    int ct_sl    = 0
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(dpt_type, i) == "COUNTER"
+                ct_total += 1
+                if array.get(dpt_tp1_hit, i)
+                    ct_tp1 += 1
+                if array.get(dpt_tp2_hit, i)
+                    ct_tp2 += 1
+                if array.get(dpt_sl_hit, i)
+                    ct_sl += 1
+    ct_total == 0 ? "" :
+    "CT today: " + str.tostring(ct_total) + " signal" + (ct_total > 1 ? "s" : "") +
+    " · TP1 " + str.tostring(ct_tp1) + " · TP2 " + str.tostring(ct_tp2) +
+    " · SL " + str.tostring(ct_sl) +
+    (ct_sl > ct_tp1 and ct_total >= 2 ? " [counter-trend drag active]" : "")
+
+// ── f_sync4_summary: master sync signal performance ───────────────────────
+f_sync4_summary() =>
+    int n          = array.size(dpt_type)
+    int s4_total   = 0
+    int s4_tp2plus = 0
+    int s4_sl      = 0
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(dpt_type, i) == "SYNC4"
+                s4_total += 1
+                if array.get(dpt_tp2_hit, i) or array.get(dpt_tp3_hit, i)
+                    s4_tp2plus += 1
+                if array.get(dpt_sl_hit, i)
+                    s4_sl += 1
+    s4_total == 0 ? "" :
+    "Sync4 today: " + str.tostring(s4_total) + " · TP2+ " + str.tostring(s4_tp2plus) +
+    " · SL " + str.tostring(s4_sl)
+
+// ── f_live_assessment: real-time session self-assessment ──────────────────
+// Replaces the static "HIGH QUALITY SESSION" / "AVERAGE SESSION" strings.
+// Built entirely from live pip tracker data — updates every bar.
+f_live_assessment() =>
+    if dpt_total_sigs == 0
+        "No signals this session yet."
+    else
+        // Core quality read
+        string quality = pip_pf >= 2.0 and pip_win_rate >= 60.0 ?
+             "Strong · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
+             " · WR " + str.tostring(pip_win_rate,"##.#") + "%" :
+             pip_pf >= 1.5 ?
+             "Good · PF "  + str.tostring(math.min(pip_pf,99.9),"#.##") +
+             " · WR " + str.tostring(pip_win_rate,"##.#") + "%" :
+             pip_pf >= 1.0 ?
+             "Positive · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") :
+             pip_losses > 0 and pip_wins == 0 ?
+             "Difficult · 0 TP vs " + str.tostring(pip_losses) + " SL" :
+             "Mixed · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
+
+        // Net pips
+        string net_s = pip_net > 0 ?
+             " · +" + str.tostring(pip_net,"#.#") + " " + pip_unit :
+             pip_net < 0 ?
+             " · "  + str.tostring(pip_net,"#.#") + " " + pip_unit : ""
+
+        // Signal volume note
+        string vol_s = dpt_total_sigs >= 5 ? " · High signal count (" +
+             str.tostring(dpt_total_sigs) + ")" : ""
+
+        quality + net_s + vol_s
+
+// ── f_avg_score_by_outcome: avg entry score for TP hits vs SL hits ─────────
+// Shows whether higher-score signals are actually delivering better outcomes.
+f_avg_score_by_outcome() =>
+    int   n        = array.size(dpt_dir)
+    float tp_score = 0.0
+    float sl_score = 0.0
+    int   tp_n     = 0
+    int   sl_n     = 0
+    if n > 0
+        for i = 0 to n - 1
+            float sc = array.get(dpt_score, i)
+            bool  tp = array.get(dpt_tp1_hit, i)
+            bool  sl = array.get(dpt_sl_hit,  i)
+            if tp
+                tp_score += math.abs(sc)
+                tp_n     += 1
+            if sl
+                sl_score += math.abs(sc)
+                sl_n     += 1
+    if tp_n == 0 and sl_n == 0
+        ""
+    else
+        string tp_avg = tp_n > 0 ? str.tostring(tp_score / tp_n,"#.#") : "—"
+        string sl_avg = sl_n > 0 ? str.tostring(sl_score / sl_n,"#.#") : "—"
+        "Avg score: TP entries " + tp_avg + "/15 · SL entries " + sl_avg + "/15"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 7 — DASHBOARD ADDITIONS
+// Patch into Section 23 (main dashboard, ~line 2013 area)
+// Find the "TODAY" block in the dashboard table.cell() calls and add these
+// table.cell() calls AFTER the existing TODAY rows.
+// The dashboard currently ends at row ~14. Add rows 15, 16, 17.
+// ══════════════════════════════════════════════════════════════════════════════
+// Note on table structure: V7 dashboard uses a single-column table where each
+// row is built by concatenating strings into one wide cell. The additions below
+// follow the same pattern — they extend the dashboard text, not add new columns.
+
+// ── ADDITION TO DASHBOARD STRING (insert after the "TODAY" section) ─────────
+// In Section 23, find where the dashboard text is assembled and append these
+// blocks after the existing Sigs/WR/Report lines:
+
+// Block A — Live Assessment (replaces static assessment in daily report section)
+// Append to dashText string after the TODAY data:
+
+string dash_assessment_block =
+     " ─────────────────────────────\n" +
+     " 📊 SESSION\n" +
+     " " + f_live_assessment() + "\n" +
+     (f_ct_summary() != "" ? " " + f_ct_summary() + "\n" : "") +
+     (f_sync4_summary() != "" ? " " + f_sync4_summary() + "\n" : "") +
+     (f_score_momentum() != "" ? " " + f_score_momentum() + "\n" : "") +
+     (f_avg_score_by_outcome() != "" ? " " + f_avg_score_by_outcome() + "\n" : "")
+
+// Block B — Episode Log (compact signal history)
+// Shows every signal today with type, score, and outcome in one line
+string dash_episode_log =
+     " ─────────────────────────────\n" +
+     " 📋 EPISODE LOG\n" +
+     " " + f_session_log() + "\n"
+
+// ── HOW TO INSERT: ──────────────────────────────────────────────────────────
+// In Section 23, the dashboard text is built into a variable (e.g. "dashText"
+// or directly into table.cell() calls). Find the last table.cell() that shows
+// the TODAY data and after it add:
+//
+//   table.cell(dashTable, 0, NEXT_ROW, dash_assessment_block,
+//              text_color=dashTextColor, text_size=size.small,
+//              bgcolor=dashColor, text_halign=text.align_left)
+//
+//   table.cell(dashTable, 0, NEXT_ROW+1, dash_episode_log,
+//              text_color=dashTextColor, text_size=size.small,
+//              bgcolor=dashColor, text_halign=text.align_left)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 8 — MEMORY-ENHANCED ENTRY COMMENTARY
+// This updates PART 4 of the first patch (ADSA_v75_string_patch.pine).
+// In the buy_signal_confirmed and sell_signal_confirmed blocks of PART 4,
+// prepend f_signal_context() to event_commentary so Telegram entry messages
+// always reference what happened before this signal.
+// ══════════════════════════════════════════════════════════════════════════════
+// Replace the event_commentary assignment in PART 4 buy_signal block with:
+
+// FOR BUY SIGNAL (replace the event_commentary := line):
+//
+//   event_commentary :=
+//        f_signal_context() + "\n" +
+//        "Exec trail ↑ at " + _p(locked_entry) +
+//        " · ATR trail: " + _pip_str(nLoss_buy) + " · " + f_atr_ctx() + "\n" +
+//        chain_line + "\n" +
+//        sov_note + "\n" +
+//        f_ai_advice_v2(1)
+//
+// FOR SELL SIGNAL (replace the event_commentary := line):
+//
+//   event_commentary :=
+//        f_signal_context() + "\n" +
+//        "Exec trail ↓ at " + _p(locked_entry) +
+//        " · ATR trail: " + _pip_str(nLoss_sell) + " · " + f_atr_ctx() + "\n" +
+//        chain_line + "\n" +
+//        sov_note + "\n" +
+//        f_ai_advice_v2(-1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 8B — MEMORY IN WAR ROOM ENTRY MESSAGE
+// In PART 4 of the first patch, the War Room prem builder adds context only for
+// entry signals and session open. Extend the context block for entry signals
+// to include the score momentum line:
+// ══════════════════════════════════════════════════════════════════════════════
+// Replace the show_full_ctx block in PART 4 with:
+//
+//   if show_full_ctx
+//       prem += _sep + "\n"
+//       prem += f_liq_ctx() + "\n"
+//       string momentum = f_score_momentum()
+//       if momentum != ""
+//           prem += momentum + "\n"
+//       prem += f_chain_synthesis(exec_state) + "\n"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 9 — PERFORMANCE TABLE FIX (real self-assessment row)
+// Replace the "ABSOLUTE DOLLAR INTELLIGENCE" footer row in the performance table
+// (Section 24, row 9) with a live assessment display.
+// ══════════════════════════════════════════════════════════════════════════════
+// FIND in Section 24:
+//   table.cell(perfTable,0,9,"ABSOLUTE DOLLAR INTELLIGENCE", ...)
+//   table.cell(perfTable,2,9,"SUPREME AGENT — ADSA v7.0", ...)
+//   table.cell(perfTable,4,9,"© 2026", ...)
+//
+// REPLACE WITH:
+//   string _assess  = f_live_assessment()
+//   string _ct_note = f_ct_summary()
+//   table.cell(perfTable, 0, 9,
+//        dpt_total_sigs > 0 ? _assess : "Waiting for first signal...",
+//        text_color = pip_net >= 0 ? color.new(#89d185,255) : color.new(#f48771,255),
+//        text_size  = size.small, bgcolor = PT_HDR, text_halign = text.align_left)
+//   table.cell(perfTable, 1, 9, "", bgcolor=PT_HDR)
+//   table.cell(perfTable, 2, 9,
+//        _ct_note != "" ? _ct_note : "ADSA v7.5",
+//        text_color = PT_MUTED, text_size = size.small,
+//        bgcolor = PT_HDR, text_halign = text.align_center)
+//   table.cell(perfTable, 3, 9, "", bgcolor=PT_HDR)
+//   table.cell(perfTable, 4, 9, "© 2026",
+//        text_color = PT_MUTED, text_size = size.small,
+//        bgcolor = PT_HDR, text_halign = text.align_right)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 10 — DAILY REPORT SELF-ASSESSMENT FIX
+// Replace the static assessment strings in Section 28 (daily report) with
+// data-driven versions that reference actual session performance.
+// ══════════════════════════════════════════════════════════════════════════════
+// FIND in Section 28 the "AGENT SELF-ASSESSMENT" block and replace the
+// conditional assessment string builder with f_daily_assessment() below:
+
+f_daily_assessment() =>
+    // Count signal types from dpt arrays
+    int n        = array.size(dpt_type)
+    int ct_count = 0
+    int s4_count = 0
+    int lo_count = 0
+    if n > 0
+        for i = 0 to n - 1
+            string t = array.get(dpt_type, i)
+            if t == "COUNTER"
+                ct_count += 1
+            else if t == "SYNC4"
+                s4_count += 1
+            else
+                lo_count += 1
+
+    float ct_pct = dpt_total_sigs > 0 ? (float(ct_count) / float(dpt_total_sigs)) * 100 : 0.0
+
+    // Build assessment from real data
+    string assess = ""
+
+    if dpt_total_sigs == 0
+        assess := "Zero signal session. Environment below threshold or operator silence active. Capital preserved."
+
+    else if pip_pf >= 2.0 and pip_win_rate >= 60.0
+        assess := "Strong session · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
+                  " · WR " + str.tostring(pip_win_rate,"##.#") + "%" +
+                  " · " + str.tostring(dpt_total_sigs) + " signals · " +
+                  str.tostring(pip_tp1_hits) + "×TP1 " +
+                  str.tostring(pip_tp2_hits) + "×TP2 " +
+                  str.tostring(pip_tp3_hits) + "×TP3 " +
+                  str.tostring(pip_losses)   + "×SL"
+
+    else if pip_pf >= 1.0
+        assess := "Positive session · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
+                  " · Net " + str.tostring(pip_net,"#.#") + " " + pip_unit +
+                  " · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
+
+    else
+        assess := "Difficult session · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
+                  " · " + str.tostring(pip_losses) + " SL vs " + str.tostring(pip_wins) + " TP" +
+                  " · Net " + str.tostring(pip_net,"#.#") + " " + pip_unit
+
+    // Append signal type breakdown
+    assess += "\nSignal mix: " + str.tostring(s4_count) + " Sync4 · " +
+              str.tostring(lo_count) + " Local · " +
+              str.tostring(ct_count) + " Counter-trend"
+
+    // Counter-trend drag flag — only shown when meaningful sample
+    if ct_pct > 40.0 and dpt_total_sigs >= 3
+        assess += "\nCounter-trend represented " + str.tostring(ct_pct,"##.#") +
+                  "% of signals — review if CT drag is impacting net result."
+
+    // Score-outcome correlation from f_avg_score_by_outcome
+    string score_corr = f_avg_score_by_outcome()
+    if score_corr != ""
+        assess += "\n" + score_corr
+
+    // Session score drift
+    string momentum = f_score_momentum()
+    if momentum != ""
+        assess += "\n" + momentum
+
+    assess
+
+// ══════════════════════════════════════════════════════════════════════════════
+// USAGE EXAMPLE — WHAT AN ENTRY MESSAGE NOW LOOKS LIKE IN TELEGRAM
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// WAR ROOM — Signal #3 on a real session (after 1 TP1 and 1 SL):
+//
+//   🟢 LONG · EURUSD 1 · 09:47 UTC
+//   ──────────────────────────
+//   Signal #3 today · Prior: 1.L[LO]+7→TP1  2.S[CT]−3→SL
+//   Exec trail ↑ at 1.08320 · ATR trail: 8.2p · ATR MED (12.1p)
+//   D↑ 15↑ 5↑ 1↑ · 4/4 layers · Score +9/15 · LDN · Inside daily range
+//   With D trail · Majority alignment (9/15) · ATR MED (12.1p)
+//   ──────────────────────────
+//   Entry  1.08320    SL 1.08240 (8.0p · $25.00)
+//   TP1    1.08400 (+8.0p · 1:1)
+//   TP2    1.08440 (+12.0p · 1.5:1)
+//   TP3    1.08480 (+16.0p · 2:1)
+//   Size   0.3125 lots · ID ATM-20260614-0947-BUY-3
+//   ──────────────────────────
+//   POC 1.08310 · Buy-liq 1.08580 · Sell-liq 1.08040
+//   Score ↑ from −3 at LDN open (now +9 — structural shift)
+//   → Full 4-layer alignment long. Trail consensus across all TFs.
+//
+// The agent is now speaking its own mechanics:
+//   — It knows it's on signal #3
+//   — It references the prior SL (counter-trend, −3 score) as context
+//   — It shows the score shifted from −3 at session open to +9 now
+//   — Every line is built from live data, not pre-written phrases
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WHAT THE DASHBOARD NOW SHOWS (SESSION section, after TODAY block)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  ─────────────────────────────
+//  📊 SESSION
+//  Strong · PF 2.14 · WR 66.7%  · +18.4 pips
+//  CT today: 1 signal · TP1 0 · SL 1 [counter-trend drag active]
+//  Sync4 today: 2 · TP2+ 2 · SL 0
+//  Score ↑ from −3 at LDN open (now +9 — structural shift)
+//  Avg score: TP entries 9.2/15 · SL entries 3.0/15
+//  ─────────────────────────────
+//  📋 EPISODE LOG
+//  1.S[CT]−3→SL  2.L[S4]+9→TP2  3.L[S4]+11→TP1  4.L[LO]+7→OPEN
+//
+// Performance table footer row now shows:
+//  [Strong · PF 2.14 · WR 66.7% · +18.4 pips]  [CT: 1 signal · TP1 0 · SL 1]  [© 2026]
+// ══════════════════════════════════════════════════════════════════════════════
