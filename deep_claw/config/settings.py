@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     sovereign_tf: Timeframe = Timeframe.D
     anchor_tf: Timeframe = Timeframe.H4
     filter_tf: Timeframe = Timeframe.H1
-    exec_tf: Timeframe = Timeframe.M15
+    exec_tf: Timeframe = Timeframe.M5
 
     # ── UT Bot / trail (cheatsheet §2.4) ─────────────────────────────────────
     ut_buy_sens: float = 3.5

@@ -36,7 +36,7 @@ _TF_TO_GRANULARITY: dict[str, int] = {
 }
 
 # TFs we subscribe to per Deriv symbol (exec-based system needs these)
-_SUBSCRIBED_TFS = [Timeframe.M5, Timeframe.M15, Timeframe.H1, Timeframe.H4, Timeframe.D]
+_SUBSCRIBED_TFS = [Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.H1, Timeframe.H4, Timeframe.D]
 
 _GRANULARITY_TO_TF = {v: k for k, v in _TF_TO_GRANULARITY.items()}
 _MAX_BACKOFF = 32
