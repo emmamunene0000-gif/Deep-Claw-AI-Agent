@@ -5,7 +5,7 @@
 // ╠══════════════════════════════════════════════════════════════════════════════╣
 // ║  CODENAME  : ABSOLUTE DOLLAR AGENT (ADA)                          ║
 // ║  EDITION   : Super Admin — Invite Only                                      ║
-// ║  VERSION   : Pine Script v6 — v7.5 Unified Intelligence Build               ║
+// ║  VERSION   : Pine Script v6 — v7.5 + Fib Gate + Pyramid Scale-In            ║
 // ╠══════════════════════════════════════════════════════════════════════════════╣
 // ║  ARCHITECTURE (17 Subsystems):                                               ║
 // ║  [1]  Fractal 4-Layer Consensus (Sovereign/Anchor/Filter/Exec)              ║
@@ -181,6 +181,8 @@ showTrailBuy       = input.bool(false, "👁 Show Buy Trail",             group=
 showTrailSell      = input.bool(false, "👁 Show Sell Trail",            group=grpATM)
 enableRegimeFilter = input.bool(true,  "🔒 Enable Regime Filter",       group=grpATM)
 requireVWAP        = input.bool(false,  "📈 Require VWAP Confirmation",  group=grpATM)
+requireFib         = input.bool(false,  "🌀 Require Fib Trend Gate",      group=grpATM,
+     tooltip="When ON: only take longs when Fib EMA basis slope is bullish, only shorts when bearish. Adds a medium-term trend filter. Default OFF — enable once you know how often it would have blocked your signals.")
 useAgentAlerts     = input.bool(true,  "📢 Activate Glass Box Reports", group=grpATM,
      tooltip="Structured reasoning report per event. Set Message = {{alert_message}} in TradingView Alert.")
 
@@ -810,6 +812,13 @@ plotshape(showRSIlabels and pcondition,  title="RSI+", style=shape.labelup,   co
 plotshape(showRSIlabels and ncondition2, title="RSI-", style=shape.labeldown, color=color.new(color.red,   66), location=location.abovebar, size=size.tiny, text="BEAR", textcolor=color.white)
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ── FIB TREND EARLY COMPUTE (used in regime gate below) ─────────────────────
+// Mirrors the Section 12 computation but named _trend_fib_gate to avoid
+// redeclaration. Values are identical — one extra EMA series, no repainting.
+_fib_b = ta.ema(ta.ema(src_fib, len_fib), len_fib)
+var int _trend_fib_gate = 0
+_trend_fib_gate := _fib_b > _fib_b[1] ? 1 : _fib_b < _fib_b[1] ? -1 : nz(_trend_fib_gate[1])
+
 // SECTION 7 — ATM BOT (ATR TRAILING STOP ENGINE)
 // ══════════════════════════════════════════════════════════════════════════════
 buyEnabled  = (c_buy  > 0) and (a_buy  > 0)
@@ -868,8 +877,8 @@ bullishRegime = positive
 bearishRegime = negative
 vwapBullish   = lastSwing ==  1
 vwapBearish   = lastSwing == -1
-regimeBullish = requireVWAP ? (bullishRegime and vwapBullish) : bullishRegime
-regimeBearish = requireVWAP ? (bearishRegime and vwapBearish) : bearishRegime
+regimeBullish = (requireVWAP ? (bullishRegime and vwapBullish) : bullishRegime) and (not requireFib or _trend_fib_gate == 1)
+regimeBearish = (requireVWAP ? (bearishRegime and vwapBearish) : bearishRegime) and (not requireFib or _trend_fib_gate == -1)
 
 buy_signal_filtered  = enableRegimeFilter ? (buy_signal  and regimeBullish) : buy_signal
 sell_signal_filtered = enableRegimeFilter ? (sell_signal and regimeBearish) : sell_signal
@@ -1154,7 +1163,7 @@ else if sell_signal_confirmed and trade_direction >= 0
     trade_direction := -1
     trade_active    := true
 
-if buy_signal_confirmed
+if buy_signal_confirmed and (not trade_active or trade_direction != 1)
     float sl_val = low > ema21 ? math.max(ema21, risk_swing_l) - (risk_atr * sl_buffer_atr) : risk_swing_l - (risk_atr * sl_buffer_atr)
     if sl_val >= close
         sl_val := close - (risk_atr * 1.5)
@@ -1178,7 +1187,7 @@ if buy_signal_confirmed
     pos_tp2_line := line.new(bar_index, locked_tp2, bar_index+5, locked_tp2, color=color.teal, style=line.style_dashed)
     pos_tp3_line := line.new(bar_index, locked_tp3, bar_index+5, locked_tp3, color=color.teal, style=line.style_solid, width=2)
 
-else if sell_signal_confirmed
+else if sell_signal_confirmed and (not trade_active or trade_direction != -1)
     float sl_val = high < ema21 ? math.min(ema21, risk_swing_h) + (risk_atr * sl_buffer_atr) : risk_swing_h + (risk_atr * sl_buffer_atr)
     if sl_val <= close
         sl_val := close + (risk_atr * 1.5)
@@ -1208,6 +1217,57 @@ if trade_active
     line.set_x2(   pos_tp1_line, bar_index + 5)
     line.set_x2(   pos_tp2_line, bar_index + 5)
     line.set_x2(   pos_tp3_line, bar_index + 5)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 14.5 — PYRAMID / SCALE-IN ENGINE (v7.5 addition)
+// ══════════════════════════════════════════════════════════════════════════════
+// Fires when the UT Bot re-confirms in the SAME direction as an open trade.
+// This means price pulled back enough to re-trigger the ATR trail,
+// then recovered — a legitimate trend-continuation entry point.
+//
+// Rules:
+//   • Only one scale-in per trade (si_active prevents stacking)
+//   • Size = 50% of original position (risk-reduced second lot)
+//   • SL = original trade entry (scale-in runs risk-free from breakeven)
+//   • Original locked_entry/sl/tp1-3 are NEVER modified
+//   • Scale-in closes when the main trade closes (SL, TP3, or Holder exit)
+
+var bool  si_active = false   // is a scale-in position currently open?
+var float si_entry  = na      // scale-in entry price
+var float si_size   = na      // scale-in lot size (50% of locked_position_size at time of entry)
+var int   si_dir    = 0       // 1=long scale-in, -1=short scale-in
+var int   si_bars   = 0       // bars since scale-in opened
+
+// Scale-in fires on a same-direction confirmed signal while trade is active
+bool scale_in_buy  = buy_signal_confirmed  and trade_active and trade_direction == 1  and not si_active
+bool scale_in_sell = sell_signal_confirmed and trade_active and trade_direction == -1 and not si_active
+
+if scale_in_buy
+    si_active := true
+    si_entry  := close
+    si_size   := locked_position_size * 0.5
+    si_dir    := 1
+    si_bars   := 0
+else if scale_in_sell
+    si_active := true
+    si_entry  := close
+    si_size   := locked_position_size * 0.5
+    si_dir    := -1
+    si_bars   := 0
+
+if si_active
+    si_bars := si_bars + 1
+    // Auto-close scale-in when main trade ends
+    if not trade_active
+        si_active := false
+        si_entry  := na
+        si_size   := na
+        si_dir    := 0
+        si_bars   := 0
+
+// Live P&L for scale-in (dashboard display only)
+float si_pnl_val = si_active and not na(si_entry) and not na(si_size) ?
+     _live_pnl(si_entry, close, si_dir, si_size) : 0.0
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 15 — TRADE ID ENGINE
@@ -2418,6 +2478,7 @@ if trade_active and not na(locked_tp1)
          "\n 🎯 TP2: " + _p(locked_tp2) + (tp2_hit ? " ✅" : "") + "  (" + _pip_str(math.abs(locked_tp2-locked_entry)) + ")" +
          "\n 🚀 TP3: " + _p(locked_tp3) + (tp3_hit ? " ✅" : "") + "  (" + _pip_str(math.abs(locked_tp3-locked_entry)) + ")" +
          (holder_mode_active ? "\n 🔱 VWAP Trail: " + _p(vap_current) : "") +
+         (si_active ? "\n ⬆️ SCALE-IN: " + _p(si_entry) + " · " + _size_display(si_size) + " · " + _pnl_str(si_pnl_val) : "") +
          "\n 📈 Peak: " + str.tostring(max_profit_pips, "#.##") + " " + pip_unit
 else
     tradeSection := "\n ⚪ Scanning for setup..."
@@ -2667,6 +2728,7 @@ bool alert_liq_sell_sweep = ta.crossunder(close, pl_btm)
 
 bool trigger_signal = not silence_mode and (
      buy_signal_confirmed or sell_signal_confirmed or
+     scale_in_buy or scale_in_sell or
      tp1_alert_event or tp2_alert_event or tp3_alert_event or
      sl_alert_event or holder_exit_event or rejection_alert or
      alert_liq_buy_sweep or alert_liq_sell_sweep or
@@ -2823,6 +2885,17 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
              chain_line_s + "\n" +
              sov_note_s + "\n" +
              f_ai_advice_v2(-1)
+
+    // ── SCALE-IN ─────────────────────────────────────────────────────────────
+    else if scale_in_buy or scale_in_sell
+        string si_dir_word = scale_in_buy ? "LONG" : "SHORT"
+        event_title      := "📐 SCALE-IN " + si_dir_word
+        event_commentary :=
+             "UT Bot re-confirmed " + si_dir_word + " while trade active.\n" +
+             "Adding " + _size_display(si_size) + " at " + _p(si_entry) + ".\n" +
+             "Scale-in SL = original entry " + _p(locked_entry) + " (breakeven).\n" +
+             "Original trade: SL " + _p(locked_sl) + " · TP3 " + _p(locked_tp3) + ".\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · " + f_session_short() + " · " + f_layer_line()
 
     // ── LIQUIDITY SWEEPS ─────────────────────────────────────────────────────
     else if alert_liq_buy_sweep
@@ -3164,8 +3237,10 @@ plot(trade_active and (sl_alert_event or holder_exit_event) ? 1 : 0, title="Trad
 // ===========================================================================
 // TradeSgnl Live Automation Execution & Alerts
 // ===========================================================================
-bool long_entry_confirmed  = buy_signal_confirmed
-bool short_entry_confirmed = sell_signal_confirmed
+bool long_entry_confirmed  = buy_signal_confirmed and (not trade_active or trade_direction != 1)
+bool short_entry_confirmed = sell_signal_confirmed and (not trade_active or trade_direction != -1)
+bool long_scalein_confirmed  = scale_in_buy
+bool short_scalein_confirmed = scale_in_sell
 
 bool long_tp1_confirmed    = trade_active and trade_direction == 1 and tp1_alert_event
 bool long_tp2_confirmed    = trade_active and trade_direction == 1 and tp2_alert_event
@@ -3208,6 +3283,12 @@ if short_tp3_confirmed
 
 if short_exit_confirmed
     strategy.close("Short", comment="Short Exit", alert_message=f_format_alert(short_exit_message, locked_position_size, locked_sl, locked_tp1, locked_tp2, locked_tp3, locked_actual_risk))
+
+if long_scalein_confirmed
+    strategy.entry("Long", strategy.long, comment="Long Scale-In", alert_message=f_format_alert(long_entry_message, si_size, locked_entry, locked_tp1, locked_tp2, locked_tp3, locked_actual_risk))
+
+if short_scalein_confirmed
+    strategy.entry("Short", strategy.short, comment="Short Scale-In", alert_message=f_format_alert(short_entry_message, si_size, locked_entry, locked_tp1, locked_tp2, locked_tp3, locked_actual_risk))
 
 // ══════════════════════════════════════════════════════════════════════════════
 // END — ABSOLUTE DOLLAR AGENT | ADA v7.0
