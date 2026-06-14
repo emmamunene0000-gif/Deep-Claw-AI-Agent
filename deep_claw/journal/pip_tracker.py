@@ -112,3 +112,20 @@ class PipTracker:
     def today(self) -> DailyStats:
         self._check_reset()
         return self._today
+
+    def get_stats(self) -> dict:
+        self._check_reset()
+        s = self._today
+        return {
+            "signals_fired": s.signal_count,
+            "signals_blocked": s.blocked_count,
+            "total_trades": s.tp1_hits + s.sl_hits + s.holder_exits,
+            "tp_hits": s.tp1_hits + s.tp2_hits + s.tp3_hits,
+            "sl_hits": s.sl_hits,
+            "net_r": round(s.net_r, 3),
+            "win_rate": round(s.win_rate, 1),
+            "profit_factor": s.profit_factor,
+            "london": s.london_count,
+            "ny": s.ny_count,
+            "asia": s.asia_count,
+        }

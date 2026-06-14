@@ -63,7 +63,7 @@ from deep_claw.perception.market_state import MarketStateBuilder
 log = logging.getLogger(__name__)
 
 # Primary timeframe that triggers signal evaluation
-_EXEC_TF = Timeframe.M15
+_EXEC_TF = settings.exec_tf
 
 
 class SymbolContext:
@@ -78,6 +78,8 @@ class SymbolContext:
         self.pip_tracker = PipTracker(symbol)
         self.position_machine: PositionStateMachine | None = None
         self.last_market_state: MarketState | None = None
+        self.last_chain_verdict = None
+        self.last_confidence_result = None
         self.session_start: datetime = datetime.now(timezone.utc)
 
 
@@ -231,6 +233,9 @@ class Orchestrator:
             conf_result = _ml_confidence(market_state)
         else:
             conf_result = confidence(market_state, DEFAULT_WEIGHT_MATRIX)
+
+        ctx.last_chain_verdict = chain_verdict
+        ctx.last_confidence_result = conf_result
 
         # Write feature row (fired=False initially — updated if accepted below)
         self._feature_store.write_candidate(
@@ -468,21 +473,104 @@ class Orchestrator:
             })
         return result
 
+    def get_last_reasoning_for(self, symbol: str) -> str:
+        recent = self._stream.recent(symbol, n=30)
+        for ep in reversed(recent):
+            if ep.episode_type in {EpisodeType.SIGNAL_ACCEPTED, EpisodeType.SIGNAL_REJECTED}:
+                reasoning = (
+                    ep.payload.get("claude_reasoning")
+                    or ep.payload.get("causal_trace")
+                    or ep.payload.get("episodic_note")
+                    or ""
+                )
+                if reasoning:
+                    ts = ep.timestamp.strftime("%H:%M UTC")
+                    return f"[{ep.episode_type.value} @ {ts}]\n{reasoning}"
+        return ""
+
     def get_last_reasoning(self) -> str:
         for sym in self._symbols:
-            recent = self._stream.recent(sym, n=30)
-            for ep in reversed(recent):
-                if ep.episode_type in {EpisodeType.SIGNAL_ACCEPTED, EpisodeType.SIGNAL_REJECTED}:
-                    reasoning = (
-                        ep.payload.get("claude_reasoning")
-                        or ep.payload.get("causal_trace")
-                        or ep.payload.get("episodic_note")
-                        or ""
-                    )
-                    if reasoning:
-                        ts = ep.timestamp.strftime("%H:%M UTC")
-                        return f"[{ep.episode_type.value} @ {ts} — {sym}]\n\n{reasoning}"
+            r = self.get_last_reasoning_for(sym)
+            if r:
+                return f"[{sym}] {r}"
         return ""
+
+    def get_dashboard_state(self) -> dict:
+        sys_state = self.get_status()
+        symbols = {}
+        for sym, ctx in self._contexts.items():
+            ms = ctx.last_market_state
+            cv = ctx.last_chain_verdict
+            cr = ctx.last_confidence_result
+
+            market_dict = {}
+            if ms:
+                try:
+                    market_dict = {
+                        "close": float(getattr(ms, "close", 0) or 0),
+                        "session": getattr(ms.session, "value", str(ms.session)) if hasattr(ms, "session") else "?",
+                        "atr_regime": getattr(ms.atr_regime, "value", str(ms.atr_regime)) if hasattr(ms, "atr_regime") else "?",
+                        "trend": getattr(ms.trend_fib, "value", str(ms.trend_fib)) if hasattr(ms, "trend_fib") else "?",
+                        "atr_val": float(getattr(ms, "atr_exec", 0) or 0),
+                        "ts": ms.timestamp.strftime("%H:%M UTC") if hasattr(ms, "timestamp") else "",
+                    }
+                except Exception:
+                    pass
+
+            chain_dict = {}
+            if cv:
+                try:
+                    chain_dict = {
+                        "verdict": getattr(cv.verdict, "value", str(cv.verdict)),
+                        "causal_trace": str(getattr(cv, "causal_trace", "") or ""),
+                        "sovereign": str(getattr(cv, "sovereign_bias", "?")),
+                        "anchor": str(getattr(cv, "anchor_bias", "?")),
+                        "filter_bias": str(getattr(cv, "filter_bias", "?")),
+                        "exec_bias": str(getattr(cv, "exec_bias", "?")),
+                    }
+                except Exception:
+                    pass
+
+            conf_dict = {}
+            if cr:
+                try:
+                    conf_dict = {
+                        "bull": float(getattr(cr, "bull_confidence", 0)),
+                        "bear": float(getattr(cr, "bear_confidence", 0)),
+                        "components": {k: float(v) for k, v in (getattr(cr, "component_scores", {}) or {}).items()},
+                    }
+                except Exception:
+                    pass
+
+            episodes = []
+            try:
+                for ep in self._stream.recent(sym, n=20):
+                    episodes.append({
+                        "type": ep.episode_type.value,
+                        "ts": ep.timestamp.strftime("%H:%M"),
+                        "summary": str(list(ep.payload.values())[0])[:60] if ep.payload else "",
+                    })
+            except Exception:
+                pass
+
+            position = next((p for p in self.get_open_positions() if p["symbol"] == sym), None)
+            stats = ctx.pip_tracker.get_stats() if hasattr(ctx.pip_tracker, "get_stats") else {}
+
+            symbols[sym] = {
+                "market": market_dict,
+                "chain": chain_dict,
+                "confidence": conf_dict,
+                "position": position,
+                "reasoning": self.get_last_reasoning_for(sym),
+                "episodes": episodes,
+                "stats": stats,
+            }
+
+        return {
+            "system": sys_state,
+            "symbols": symbols,
+            "exec_tf": settings.exec_tf.value,
+        }
 
     def get_today_summary(self) -> str:
         lines = []

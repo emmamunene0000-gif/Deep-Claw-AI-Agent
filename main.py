@@ -106,7 +106,7 @@ async def main(symbols: list[str]) -> None:
     try:
         import uvicorn
         from deep_claw.communication.dashboard import build_app
-        app = build_app(orch.stream, orch.renderer, orch.pip_trackers, orch.daily_report)
+        app = build_app(orch)
         config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="warning")
         server = uvicorn.Server(config)
         dashboard_task = asyncio.create_task(server.serve())

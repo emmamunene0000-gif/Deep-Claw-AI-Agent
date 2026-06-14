@@ -30,7 +30,7 @@ _TF_TO_INTERVAL: dict[str, str] = {
     Timeframe.D.value:   "D",
 }
 
-_SUBSCRIBED_TFS = [Timeframe.M5, Timeframe.M15, Timeframe.H1, Timeframe.H4, Timeframe.D]
+_SUBSCRIBED_TFS = [Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.H1, Timeframe.H4, Timeframe.D]
 
 _BYBIT_LIVE_URL  = "wss://stream.bybit.com/v5/public/linear"
 _BYBIT_DEMO_URL  = "wss://stream-demo.bybit.com/v5/public/linear"
