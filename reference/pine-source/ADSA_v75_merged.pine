@@ -1952,10 +1952,8 @@ f_layers_count(int direction) =>
     n
 
 f_layer_line() =>
-    "D"  + f_arrow(sovereign_state) + " " +
-    anchor_tf + "m" + f_arrow(anchor_state) + " " +
-    filter_tf + "m" + f_arrow(filter_state) + " " +
-    timeframe.period + "m" + f_arrow(exec_state)
+    string _ll = "D" + f_arrow(sovereign_state) + " " + anchor_tf + "m" + f_arrow(anchor_state) + " " + filter_tf + "m" + f_arrow(filter_state) + " " + timeframe.period + "m" + f_arrow(exec_state)
+    _ll
 
 f_state_short(string s) =>
     s == "Long" or s == "Bull" ? "L" : s == "Short" or s == "Bear" ? "S" : "N"
@@ -2009,12 +2007,8 @@ f_ai_advice_v2(int direction) =>
                       "Buy-liq " + _p(ph_top) + " above"  :
                       direction == -1 and not na(pl_btm) ?
                       "Sell-liq " + _p(pl_btm) + " below" : ""
-    f_score_word(total_score) + " alignment (" +
-    str.tostring(math.abs(total_score), "#.#") + "/15)" +
-    " · " + sov_rel +
-    " · " + f_atr_ctx() +
-    (liq_note != "" ? " · " + liq_note : "") +
-    " · " + pdh_pdl_status
+    string _liq_sfx = liq_note != "" ? " · " + liq_note : ""
+    f_score_word(total_score) + " alignment (" + str.tostring(math.abs(total_score), "#.#") + "/15) · " + sov_rel + " · " + f_atr_ctx() + _liq_sfx + " · " + pdh_pdl_status
 
 string ai_advice = f_ai_advice_v2(exec_state)
 
@@ -2316,9 +2310,7 @@ f_score_momentum() =>
         string arrow = drift > 2 ? "↑" : drift < -2 ? "↓" : "→"
         string mag   = math.abs(drift) > 6 ? " — structural shift" :
                        math.abs(drift) > 3 ? " — bias strengthening" : ""
-        "Score " + arrow + " from " + str.tostring(mem_session_open_score,"#.#") +
-        " at " + mem_session_label + " open (now " +
-        str.tostring(total_score,"#.#") + mag + ")"
+        "Score " + arrow + " from " + str.tostring(mem_session_open_score,"#.#") + " at " + mem_session_label + " open (now " + str.tostring(total_score,"#.#") + mag + ")"
 
 f_ct_summary() =>
     int n        = array.size(dpt_type)
@@ -2340,9 +2332,7 @@ f_ct_summary() =>
         ""
     else
         string _drag = ct_sl > ct_tp1 and ct_total >= 2 ? " [counter-trend drag active]" : ""
-        "CT today: " + str.tostring(ct_total) + " signal" + (ct_total > 1 ? "s" : "") +
-        " · TP1 " + str.tostring(ct_tp1) + " · TP2 " + str.tostring(ct_tp2) +
-        " · SL " + str.tostring(ct_sl) + _drag
+        "CT today: " + str.tostring(ct_total) + " signal" + (ct_total > 1 ? "s" : "") + " · TP1 " + str.tostring(ct_tp1) + " · TP2 " + str.tostring(ct_tp2) + " · SL " + str.tostring(ct_sl) + _drag
 
 f_sync4_summary() =>
     int n          = array.size(dpt_type)
@@ -2366,23 +2356,12 @@ f_live_assessment() =>
     if dpt_total_sigs == 0
         "No signals this session yet."
     else
-        string quality = pip_pf >= 2.0 and pip_win_rate >= 60.0 ?
-             "Strong · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
-             " · WR " + str.tostring(pip_win_rate,"##.#") + "%" :
-             pip_pf >= 1.5 ?
-             "Good · PF "  + str.tostring(math.min(pip_pf,99.9),"#.##") +
-             " · WR " + str.tostring(pip_win_rate,"##.#") + "%" :
-             pip_pf >= 1.0 ?
-             "Positive · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") :
-             pip_losses > 0 and pip_wins == 0 ?
-             "Difficult · 0 TP vs " + str.tostring(pip_losses) + " SL" :
-             "Mixed · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
-        string net_s = pip_net > 0 ?
-             " · +" + str.tostring(pip_net,"#.#") + " " + pip_unit :
-             pip_net < 0 ?
-             " · "  + str.tostring(pip_net,"#.#") + " " + pip_unit : ""
-        string vol_s = dpt_total_sigs >= 5 ? " · High signal count (" +
-             str.tostring(dpt_total_sigs) + ")" : ""
+        string _pf_s  = str.tostring(math.min(pip_pf,99.9),"#.##")
+        string _wr_s  = str.tostring(pip_win_rate,"##.#")
+        string _net_v = str.tostring(pip_net,"#.#")
+        string quality = pip_pf >= 2.0 and pip_win_rate >= 60.0 ? "Strong · PF " + _pf_s + " · WR " + _wr_s + "%" : pip_pf >= 1.5 ? "Good · PF " + _pf_s + " · WR " + _wr_s + "%" : pip_pf >= 1.0 ? "Positive · PF " + _pf_s : pip_losses > 0 and pip_wins == 0 ? "Difficult · 0 TP vs " + str.tostring(pip_losses) + " SL" : "Mixed · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
+        string net_s  = pip_net > 0 ? " · +" + _net_v + " " + pip_unit : pip_net < 0 ? " · " + _net_v + " " + pip_unit : ""
+        string vol_s  = dpt_total_sigs >= 5 ? " · High signal count (" + str.tostring(dpt_total_sigs) + ")" : ""
         quality + net_s + vol_s
 
 f_avg_score_by_outcome() =>
@@ -2423,32 +2402,22 @@ f_daily_assessment() =>
                 s4_count += 1
             else
                 lo_count += 1
-    float ct_pct = dpt_total_sigs > 0 ? (float(ct_count) / float(dpt_total_sigs)) * 100 : 0.0
-    string assess = ""
+    float ct_pct   = dpt_total_sigs > 0 ? (float(ct_count) / float(dpt_total_sigs)) * 100 : 0.0
+    string _pf_da  = str.tostring(math.min(pip_pf,99.9),"#.##")
+    string _wr_da  = str.tostring(pip_win_rate,"##.#")
+    string _net_da = str.tostring(pip_net,"#.#")
+    string assess  = ""
     if dpt_total_sigs == 0
         assess := "Zero signal session. Environment below threshold or operator silence active. Capital preserved."
     else if pip_pf >= 2.0 and pip_win_rate >= 60.0
-        assess := "Strong session · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
-                  " · WR " + str.tostring(pip_win_rate,"##.#") + "%" +
-                  " · " + str.tostring(dpt_total_sigs) + " signals · " +
-                  str.tostring(pip_tp1_hits) + "×TP1 " +
-                  str.tostring(pip_tp2_hits) + "×TP2 " +
-                  str.tostring(pip_tp3_hits) + "×TP3 " +
-                  str.tostring(pip_losses)   + "×SL"
+        assess := "Strong session · PF " + _pf_da + " · WR " + _wr_da + "% · " + str.tostring(dpt_total_sigs) + " signals · " + str.tostring(pip_tp1_hits) + "×TP1 " + str.tostring(pip_tp2_hits) + "×TP2 " + str.tostring(pip_tp3_hits) + "×TP3 " + str.tostring(pip_losses) + "×SL"
     else if pip_pf >= 1.0
-        assess := "Positive session · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
-                  " · Net " + str.tostring(pip_net,"#.#") + " " + pip_unit +
-                  " · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
+        assess := "Positive session · PF " + _pf_da + " · Net " + _net_da + " " + pip_unit + " · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
     else
-        assess := "Difficult session · PF " + str.tostring(math.min(pip_pf,99.9),"#.##") +
-                  " · " + str.tostring(pip_losses) + " SL vs " + str.tostring(pip_wins) + " TP" +
-                  " · Net " + str.tostring(pip_net,"#.#") + " " + pip_unit
-    assess += "\nSignal mix: " + str.tostring(s4_count) + " Sync4 · " +
-              str.tostring(lo_count) + " Local · " +
-              str.tostring(ct_count) + " Counter-trend"
+        assess := "Difficult session · PF " + _pf_da + " · " + str.tostring(pip_losses) + " SL vs " + str.tostring(pip_wins) + " TP · Net " + _net_da + " " + pip_unit
+    assess += "\nSignal mix: " + str.tostring(s4_count) + " Sync4 · " + str.tostring(lo_count) + " Local · " + str.tostring(ct_count) + " Counter-trend"
     if ct_pct > 40.0 and dpt_total_sigs >= 3
-        assess += "\nCounter-trend represented " + str.tostring(ct_pct,"##.#") +
-                  "% of signals — review if CT drag is impacting net result."
+        assess += "\nCounter-trend represented " + str.tostring(ct_pct,"##.#") + "% of signals — review if CT drag is impacting net result."
     string score_corr = f_avg_score_by_outcome()
     if score_corr != ""
         assess += "\n" + score_corr
@@ -2694,44 +2663,42 @@ _build_sl_autopsy() =>
        (sovereign_state == 1  and trade_direction == -1)
         string sov_dir   = sovereign_state == -1 ? "BEARISH" : "BULLISH"
         string trade_dir = trade_direction  == 1 ? "long"    : "short"
-        out := "COUNTER-TREND: D trail was " + sov_dir + " at entry.\n" +
-               trade_dir + " entered against sovereign structure.\n" +
-               "Exec TF confirmed — macro structure reasserted before target.\n" +
-               "Score at entry: " + str.tostring(total_score,"#.#") + "/15 · Peak: " +
-               str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "."
+        string _a1 = "COUNTER-TREND: D trail was " + sov_dir + " at entry.\n" + trade_dir + " entered against sovereign structure."
+        string _a2 = "\nExec TF confirmed — macro structure reasserted before target."
+        string _a3 = "\nScore at entry: " + str.tostring(total_score,"#.#") + "/15 · Peak: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "."
+        out := _a1 + _a2 + _a3
 
     // Priority 2: Stop placed at/near a liquidity pool that was swept
     else if str.contains(liq_bias,"BREAKING")
         string swept = str.contains(liq_bias,"HIGH") ? "buy-side" : "sell-side"
-        out := "LIQ ZONE SWEEP: Stop was at/near the " + swept + " pool.\n" +
-               "Price swept beyond the pool before reversing.\n" +
-               "SL buffer (" + str.tostring(sl_buffer_atr,"#.#") + " ATR) did not clear the sweep depth.\n" +
-               "Consider placing SL beyond the zone rather than at it."
+        string _b1 = "LIQ ZONE SWEEP: Stop was at/near the " + swept + " pool."
+        string _b2 = "\nPrice swept beyond the pool before reversing."
+        string _b3 = "\nSL buffer (" + str.tostring(sl_buffer_atr,"#.#") + " ATR) did not clear the sweep depth."
+        string _b4 = "\nConsider placing SL beyond the zone rather than at it."
+        out := _b1 + _b2 + _b3 + _b4
 
     // Priority 3: ATR Low state (tight conditions, SL prone to noise)
     else if atrHL == "Low"
-        out := "LOW ATR: Volatility was compressed at stop time.\n" +
-               "ATR: " + str.tostring(atrN,"#.#####") + " · SL distance was " +
-               _pip_str(locked_risk_dist) + " (" +
-               str.tostring(sl_buffer_atr,"#.#") + " ATR buffer).\n" +
-               "In low-ATR conditions, small noise moves can clip stops.\n" +
-               "Widening SL buffer or reducing size reduces this risk."
+        string _c1 = "LOW ATR: Volatility was compressed at stop time."
+        string _c2 = "\nATR: " + str.tostring(atrN,"#.#####") + " · SL distance was " + _pip_str(locked_risk_dist) + " (" + str.tostring(sl_buffer_atr,"#.#") + " ATR buffer)."
+        string _c3 = "\nIn low-ATR conditions, small noise moves can clip stops. Widening SL buffer or reducing size reduces this risk."
+        out := _c1 + _c2 + _c3
 
     // Priority 4: Weak alignment at entry (score below meaningful threshold)
     else if math.abs(total_score) < 4
         float agree_tfs = math.round((math.abs(total_score) / 3.0))
-        out := "WEAK ALIGNMENT: Score " + str.tostring(total_score,"#.#") + "/15 at entry.\n" +
-               "Approximately " + str.tostring(agree_tfs,"#") + "/5 TF layers agreed.\n" +
-               "Partial alignment entries carry higher invalidation risk.\n" +
-               "Exec TF fired but higher TFs had not confirmed direction."
+        string _d1 = "WEAK ALIGNMENT: Score " + str.tostring(total_score,"#.#") + "/15 at entry."
+        string _d2 = "\nApproximately " + str.tostring(agree_tfs,"#") + "/5 TF layers agreed."
+        string _d3 = "\nPartial alignment entries carry higher invalidation risk. Exec TF fired but higher TFs had not confirmed direction."
+        out := _d1 + _d2 + _d3
 
     // Default: honest — no dominant pattern identified
     else
-        out := "NO DOMINANT PATTERN: Trade structure was valid at entry.\n" +
-               "Score: " + str.tostring(total_score,"#.#") + "/15 · ATR: " + atrHL +
-               " · Session: " + current_session + "\n" +
-               "Peak before stop: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + ".\n" +
-               "Logged for pattern accumulation. No parameter change recommended."
+        string _e1 = "NO DOMINANT PATTERN: Trade structure was valid at entry."
+        string _e2 = "\nScore: " + str.tostring(total_score,"#.#") + "/15 · ATR: " + atrHL + " · Session: " + current_session
+        string _e3 = "\nPeak before stop: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "."
+        string _e4 = "\nLogged for pattern accumulation. No parameter change recommended."
+        out := _e1 + _e2 + _e3 + _e4
     out
 
 // ══════════════════════════════════════════════════════════════════════════════
