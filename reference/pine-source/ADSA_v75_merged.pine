@@ -2789,11 +2789,13 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
     // ── SILENCE BROADCAST ────────────────────────────────────────────────────
     if silence_broadcast
         event_title      := "🔇 STANDING ASIDE"
-        string _sil_body = atrHL == "Low" ?
-             "ATR LOW — compressed range. No setups until volatility expands.\nATR: " + str.tostring(atrN,"#.#####") + " vs 20-bar avg." :
-             math.abs(total_score) < 3 ?
-             "Score " + str.tostring(total_score,"#.#") + "/15 — no dominant bias.\n" + _bc_ll + " — mixed trail state." :
-             "Operator silence active. Score: " + str.tostring(total_score,"#.#") + "/15.\n" + _bc_ll + " · " + pdh_pdl_status + "."
+        string _sil_body = ""
+        if atrHL == "Low"
+            _sil_body := "ATR LOW — compressed range. No setups until volatility expands.\nATR: " + str.tostring(atrN,"#.#####") + " vs 20-bar avg."
+        else if math.abs(total_score) < 3
+            _sil_body := "Score " + str.tostring(total_score,"#.#") + "/15 — no dominant bias.\n" + _bc_ll + " — mixed trail state."
+        else
+            _sil_body := "Operator silence active. Score: " + str.tostring(total_score,"#.#") + "/15.\n" + _bc_ll + " · " + pdh_pdl_status + "."
         string _sil_note = admin_commentary != "" ? "\nNote: " + admin_commentary : ""
         event_commentary := _sil_body + _sil_note
 
@@ -2858,18 +2860,30 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
         string rsi_val_s  = str.tostring(rsi, "#.#")
         bool  rsi_fail    = is_long ? not (rsi > pmom) : not (rsi < nmom)
         bool  vwap_fail   = is_long ? not vwapBullish  : not vwapBearish
-        string rsi_note   = rsi_fail ?
-             "RSI " + rsi_val_s + (is_long ? " < " + str.tostring(pmom,"#") + " (bull threshold)" :
-                                             " > " + str.tostring(nmom,"#") + " (bear threshold)") : ""
-        string vwap_note  = vwap_fail ?
-             "VWAP: price " + (is_long ? "below" : "above") + " " + _p(vap_current) : ""
-        string failed     = rsi_fail and vwap_fail ? rsi_note + " · " + vwap_note :
-                            rsi_fail                ? rsi_note  : vwap_note
-        string needs      = rsi_fail and vwap_fail ?
-             "RSI " + (is_long ? "> " + str.tostring(pmom,"#") : "< " + str.tostring(nmom,"#")) +
-             " AND price " + (is_long ? "above" : "below") + " VWAP" :
-             rsi_fail ? "RSI " + (is_long ? "> " + str.tostring(pmom,"#") : "< " + str.tostring(nmom,"#")) :
-             "Price " + (is_long ? "above" : "below") + " VWAP " + _p(vap_current)
+        string _pmom_s    = str.tostring(pmom,"#")
+        string _nmom_s    = str.tostring(nmom,"#")
+        string rsi_note   = ""
+        if rsi_fail
+            rsi_note := "RSI " + rsi_val_s + (is_long ? " < " + _pmom_s + " (bull threshold)" : " > " + _nmom_s + " (bear threshold)")
+        string vwap_note  = ""
+        if vwap_fail
+            vwap_note := "VWAP: price " + (is_long ? "below" : "above") + " " + _p(vap_current)
+        string failed     = ""
+        if rsi_fail and vwap_fail
+            failed := rsi_note + " · " + vwap_note
+        else if rsi_fail
+            failed := rsi_note
+        else
+            failed := vwap_note
+        string _rsi_need  = is_long ? "RSI > " + _pmom_s : "RSI < " + _nmom_s
+        string _vw_dir    = is_long ? "above" : "below"
+        string needs      = ""
+        if rsi_fail and vwap_fail
+            needs := _rsi_need + " AND price " + _vw_dir + " VWAP"
+        else if rsi_fail
+            needs := _rsi_need
+        else
+            needs := "Price " + _vw_dir + " VWAP " + _p(vap_current)
         event_commentary :=
              "Trail flipped " + dir_word_r + " — regime gate rejected.\n" +
              "Failed: " + failed + "\n" +
@@ -2878,9 +2892,7 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
 
     // ── BUY SIGNAL ───────────────────────────────────────────────────────────
     else if buy_signal_confirmed
-        string sync_tag_b = master_sync_buy       ? "🔥 MASTER SYNC LONG"     :
-                            sovereign_counter_buy  ? "⚠️ COUNTER-TREND LONG" :
-                                                     "🟢 LONG"
+        string sync_tag_b = master_sync_buy ? "🔥 MASTER SYNC LONG" : sovereign_counter_buy ? "⚠️ COUNTER-TREND LONG" : "🟢 LONG"
         event_title := sync_tag_b
         int  n_agree_b = f_layers_count(1)
         string _nb_s = str.tostring(n_agree_b,"#")
@@ -2890,9 +2902,7 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
 
     // ── SELL SIGNAL ──────────────────────────────────────────────────────────
     else if sell_signal_confirmed
-        string sync_tag_s = master_sync_sell      ? "🥶 MASTER SYNC SHORT"    :
-                            sovereign_counter_sell ? "⚠️ COUNTER-TREND SHORT" :
-                                                     "🔴 SHORT"
+        string sync_tag_s = master_sync_sell ? "🥶 MASTER SYNC SHORT" : sovereign_counter_sell ? "⚠️ COUNTER-TREND SHORT" : "🔴 SHORT"
         event_title := sync_tag_s
         int  n_agree_s = f_layers_count(-1)
         string _ns_s = str.tostring(n_agree_s,"#")
@@ -2914,9 +2924,7 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
     // ── LIQUIDITY SWEEPS ─────────────────────────────────────────────────────
     else if alert_liq_buy_sweep
         event_title      := "⚡ BUY-SIDE LIQ SWEPT"
-        string score_lean_b = total_score < -2 ? "Bearish score lean → false-break probability elevated." :
-                              total_score > 2  ? "Bullish score lean → breakout continuation possible."   :
-                                                 "Neutral score — no lean. Outcome open."
+        string score_lean_b = total_score < -2 ? "Bearish score lean → false-break probability elevated." : total_score > 2 ? "Bullish score lean → breakout continuation possible." : "Neutral score — no lean. Outcome open."
         event_commentary :=
              "Pool at " + _p(ph_top) + " swept.\n" +
              "Score: " + str.tostring(total_score,"#.#") + "/15 · Structure: " +
@@ -2926,9 +2934,7 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
 
     else if alert_liq_sell_sweep
         event_title      := "⚡ SELL-SIDE LIQ SWEPT"
-        string score_lean_s = total_score > 2  ? "Bullish score lean → false-break probability elevated." :
-                              total_score < -2 ? "Bearish score lean → breakdown continuation possible."  :
-                                                 "Neutral score — no lean. Outcome open."
+        string score_lean_s = total_score > 2 ? "Bullish score lean → false-break probability elevated." : total_score < -2 ? "Bearish score lean → breakdown continuation possible." : "Neutral score — no lean. Outcome open."
         event_commentary :=
              "Pool at " + _p(pl_btm) + " swept.\n" +
              "Score: " + str.tostring(total_score,"#.#") + "/15 · Structure: " +
@@ -2958,22 +2964,24 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
     // ── SESSION OPEN ─────────────────────────────────────────────────────────
     else if vp_newSession
         event_title := "🕒 " + f_session_short() + " SESSION OPEN"
-        string open_ctx_so = atrHL == "Low" ?
-             "ATR LOW — compressed range. Higher noise, tighter stops at risk. Wait for expansion." :
-             math.abs(total_score) < 3 ?
-             "Score " + str.tostring(total_score,"#.#") + "/15 — mixed alignment. No dominant bias yet." :
-             total_score >= 3 ?
-             "Score " + str.tostring(total_score,"#.#") + "/15 — bullish lean. Watch M5 trail for long entries." :
-             "Score " + str.tostring(total_score,"#.#") + "/15 — bearish lean. Watch M5 trail for short entries."
-        string poc_ctx_so  = vpEnabled and not na(vp_currentPOC) ?
-             "POC " + _p(vp_currentPOC) + " · VAH " +
-             _p(array.get(vp_vaLevels,1)) + " · VAL " + _p(array.get(vp_vaLevels,0)) :
-             "VP not computed yet."
-        string agenda_so   = total_score < -2 and sovereign_state == -1 ?
-             "Bearish setup favoured. Sell-liq " + _p(pl_btm) + " as first magnet. Watch M5 trail ↓." :
-             total_score > 2  and sovereign_state == 1  ?
-             "Bullish setup favoured. Buy-liq "  + _p(ph_top) + " as first magnet. Watch M5 trail ↑." :
-             "Mixed conditions at open. Waiting for score and trail to align before positioning."
+        string open_ctx_so = ""
+        if atrHL == "Low"
+            open_ctx_so := "ATR LOW — compressed range. Higher noise, tighter stops at risk. Wait for expansion."
+        else if math.abs(total_score) < 3
+            open_ctx_so := "Score " + str.tostring(total_score,"#.#") + "/15 — mixed alignment. No dominant bias yet."
+        else if total_score >= 3
+            open_ctx_so := "Score " + str.tostring(total_score,"#.#") + "/15 — bullish lean. Watch M5 trail for long entries."
+        else
+            open_ctx_so := "Score " + str.tostring(total_score,"#.#") + "/15 — bearish lean. Watch M5 trail for short entries."
+        string _poc_lv = vpEnabled and not na(vp_currentPOC) ? "POC " + _p(vp_currentPOC) + " · VAH " + _p(array.get(vp_vaLevels,1)) + " · VAL " + _p(array.get(vp_vaLevels,0)) : "VP not computed yet."
+        string poc_ctx_so  = _poc_lv
+        string agenda_so   = ""
+        if total_score < -2 and sovereign_state == -1
+            agenda_so := "Bearish setup favoured. Sell-liq " + _p(pl_btm) + " as first magnet. Watch M5 trail ↓."
+        else if total_score > 2 and sovereign_state == 1
+            agenda_so := "Bullish setup favoured. Buy-liq " + _p(ph_top) + " as first magnet. Watch M5 trail ↑."
+        else
+            agenda_so := "Mixed conditions at open. Waiting for score and trail to align before positioning."
         string _so_line2 = "ATR " + _bc_atr + " · D " + _bc_ll + " · Score " + str.tostring(total_score,"#.#") + "/15"
         event_commentary :=
              current_session + " · " + pdh_pdl_status + "\n" +
@@ -3038,10 +3046,9 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
         else if tp1_alert_event
             pub += "1:1 partial secured · trade ongoing.\n"
         else if buy_signal_confirmed or sell_signal_confirmed
-            string dir_str_pub  = buy_signal_confirmed ? "Long" : "Short"
-            string tag_pub      = master_sync_buy or master_sync_sell       ? "4/4 TF aligned" :
-                                  sovereign_counter_buy or sovereign_counter_sell ? "counter-trend · D opposing" :
-                                  str.tostring(f_layers_count(buy_signal_confirmed?1:-1),"#") + "/4 TF aligned"
+            string dir_str_pub = buy_signal_confirmed ? "Long" : "Short"
+            int _pub_lc_cnt    = f_layers_count(buy_signal_confirmed ? 1 : -1)
+            string tag_pub     = master_sync_buy or master_sync_sell ? "4/4 TF aligned" : sovereign_counter_buy or sovereign_counter_sell ? "counter-trend · D opposing" : str.tostring(_pub_lc_cnt,"#") + "/4 TF aligned"
             pub += dir_str_pub + " · Score " + str.tostring(total_score,"#.#") + "/15 · " + tag_pub + "\n"
         else if alert_liq_buy_sweep or alert_liq_sell_sweep
             pub += (alert_liq_buy_sweep ? "Buy-side" : "Sell-side") +
