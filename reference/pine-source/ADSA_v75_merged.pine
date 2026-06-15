@@ -1960,21 +1960,35 @@ f_state_short(string s) =>
 
 f_score_word(float sc) =>
     float a = math.abs(sc)
-    a >= 10 ? "Strong"   :
-    a >= 6  ? "Majority" :
-    a >= 3  ? "Partial"  :
-    a > 0   ? "Weak"     : "Mixed"
+    if a >= 10
+        "Strong"
+    else if a >= 6
+        "Majority"
+    else if a >= 3
+        "Partial"
+    else if a > 0
+        "Weak"
+    else
+        "Mixed"
 
 f_atr_ctx() =>
     string ap = str.tostring(_pips(atrN), "#.#")
-    atrHL == "High" ? "ATR HIGH (" + ap + "p) · volatile"    :
-    atrHL == "Low"  ? "ATR LOW ("  + ap + "p) · choppy range" :
-                      "ATR MED ("  + ap + "p)"
+    if atrHL == "High"
+        "ATR HIGH (" + ap + "p) · volatile"
+    else if atrHL == "Low"
+        "ATR LOW (" + ap + "p) · choppy range"
+    else
+        "ATR MED (" + ap + "p)"
 
 f_session_short() =>
-    str.contains(current_session, "NY")     ? "NY"  :
-    str.contains(current_session, "LONDON") ? "LDN" :
-    str.contains(current_session, "TOKYO")  ? "TKO" : "OTC"
+    if str.contains(current_session, "NY")
+        "NY"
+    else if str.contains(current_session, "LONDON")
+        "LDN"
+    else if str.contains(current_session, "TOKYO")
+        "TKO"
+    else
+        "OTC"
 
 f_liq_ctx() =>
     string poc_str = vpEnabled and not na(vp_currentPOC) ? "POC " + _p(vp_currentPOC) + " · " : ""
@@ -2001,14 +2015,22 @@ f_ts() =>
 
 // ai_advice — live-assembled from 4 real variables (replaces 7-phrase static lookup)
 f_ai_advice_v2(int direction) =>
-    string sov_rel  = sovereign_state == direction  ? "with D trail"    :
-                      sovereign_state == 0          ? "D trail flat"    : "against D trail"
-    string liq_note = direction == 1 and not na(ph_top) ?
-                      "Buy-liq " + _p(ph_top) + " above"  :
-                      direction == -1 and not na(pl_btm) ?
-                      "Sell-liq " + _p(pl_btm) + " below" : ""
+    string sov_rel = ""
+    if sovereign_state == direction
+        sov_rel := "with D trail"
+    else if sovereign_state == 0
+        sov_rel := "D trail flat"
+    else
+        sov_rel := "against D trail"
+    string liq_note = ""
+    if direction == 1 and not na(ph_top)
+        liq_note := "Buy-liq " + _p(ph_top) + " above"
+    else if direction == -1 and not na(pl_btm)
+        liq_note := "Sell-liq " + _p(pl_btm) + " below"
     string _liq_sfx = liq_note != "" ? " · " + liq_note : ""
-    f_score_word(total_score) + " alignment (" + str.tostring(math.abs(total_score), "#.#") + "/15) · " + sov_rel + " · " + f_atr_ctx() + _liq_sfx + " · " + pdh_pdl_status
+    string _sw = f_score_word(total_score)
+    string _ac = f_atr_ctx()
+    _sw + " alignment (" + str.tostring(math.abs(total_score), "#.#") + "/15) · " + sov_rel + " · " + _ac + _liq_sfx + " · " + pdh_pdl_status
 
 string ai_advice = f_ai_advice_v2(exec_state)
 
@@ -2334,8 +2356,7 @@ f_score_momentum() =>
     else
         float drift = total_score - mem_session_open_score
         string arrow = drift > 2 ? "↑" : drift < -2 ? "↓" : "→"
-        string mag   = math.abs(drift) > 6 ? " — structural shift" :
-                       math.abs(drift) > 3 ? " — bias strengthening" : ""
+        string mag = math.abs(drift) > 6 ? " — structural shift" : math.abs(drift) > 3 ? " — bias strengthening" : ""
         "Score " + arrow + " from " + str.tostring(mem_session_open_score,"#.#") + " at " + mem_session_label + " open (now " + str.tostring(total_score,"#.#") + mag + ")"
 
 f_ct_summary() =>
