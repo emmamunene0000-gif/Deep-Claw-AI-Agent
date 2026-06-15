@@ -2014,40 +2014,66 @@ string ai_advice = f_ai_advice_v2(exec_state)
 
 // ── CHAIN NARRATIVE (replaces tree format — same data, chain-logic layout) ───
 // Variable name kept as tree_narrative so all downstream references work unchanged.
-// Each TF shows trail direction (↑↓→), indicator states (L/S/N), score with sign.
-// Bottom line synthesises what it all means for the current exec direction.
+// Pre-compute all v7.5 helper calls → no inline nested-function calls in multi-line string.
+
+string _tn_d  = f_arrow(sovereign_state)
+string _tn_a  = f_arrow(anchor_state)
+string _tn_f  = f_arrow(filter_state)
+string _tn_sr = f_state_short(sov_r)
+string _tn_sv = f_state_short(sov_v)
+string _tn_sf = f_state_short(sov_f)
+string _tn_hr = f_state_short(h4_r)
+string _tn_hv = f_state_short(h4_v)
+string _tn_hf = f_state_short(h4_f)
+string _tn_1r = f_state_short(h1_r)
+string _tn_1v = f_state_short(h1_v)
+string _tn_1f = f_state_short(h1_f)
+string _tn_mr = f_state_short(m15_r)
+string _tn_mv = f_state_short(m15_v)
+string _tn_mf = f_state_short(m15_f)
+string _tn_5r = f_state_short(m5_r)
+string _tn_5v = f_state_short(m5_v)
+string _tn_5f = f_state_short(m5_f)
+string _tn_ds = f_score_str(sov_score)
+string _tn_hs = f_score_str(h4_score)
+string _tn_1s = f_score_str(h1_score)
+string _tn_ms = f_score_str(m15_score)
+string _tn_5s = f_score_str(m5_score)
+string _tn_wd = f_score_word(total_score)
+string _tn_ll = f_layer_line()
+string _tn_sy = f_chain_synthesis(exec_state)
 
 tree_narrative =
-     "D  " + f_arrow(sovereign_state) + " " +
+     "D  " + _tn_d + " " +
      (sov_score>=2.5?"🟢":sov_score<=-2.5?"🔴":sov_score>0?"🟡":sov_score<0?"🟠":"⚪") +
-     "  R:" + f_state_short(sov_r) + " V:" + f_state_short(sov_v) +
-     " F:" + f_state_short(sov_f) + " RSI:" + sov_ri +
-     "  " + f_score_str(sov_score) +
+     "  R:" + _tn_sr + " V:" + _tn_sv +
+     " F:" + _tn_sf + " RSI:" + sov_ri +
+     "  " + _tn_ds +
      ((sovereign_state==-1 and exec_state==1) or (sovereign_state==1 and exec_state==-1)
       ? "  [VETO]" : "  ← Sovereign") + "\n" +
      "H4    " +
      (h4_score>=2.5?"🟢":h4_score<=-2.5?"🔴":h4_score>0?"🟡":h4_score<0?"🟠":"⚪") +
-     "  R:" + f_state_short(h4_r) + " V:" + f_state_short(h4_v) +
-     " F:" + f_state_short(h4_f) + " RSI:" + h4_ri +
-     "  " + f_score_str(h4_score) + "\n" +
+     "  R:" + _tn_hr + " V:" + _tn_hv +
+     " F:" + _tn_hf + " RSI:" + h4_ri +
+     "  " + _tn_hs + "\n" +
      "H1    " +
      (h1_score>=2.5?"🟢":h1_score<=-2.5?"🔴":h1_score>0?"🟡":h1_score<0?"🟠":"⚪") +
-     "  R:" + f_state_short(h1_r) + " V:" + f_state_short(h1_v) +
-     " F:" + f_state_short(h1_f) + " RSI:" + h1_ri +
-     "  " + f_score_str(h1_score) + "  ← Session bias\n" +
-     "M15 " + f_arrow(anchor_state) + " " +
+     "  R:" + _tn_1r + " V:" + _tn_1v +
+     " F:" + _tn_1f + " RSI:" + h1_ri +
+     "  " + _tn_1s + "  ← Session bias\n" +
+     "M15 " + _tn_a + " " +
      (m15_score>=2.5?"🟢":m15_score<=-2.5?"🔴":m15_score>0?"🟡":m15_score<0?"🟠":"⚪") +
-     "  R:" + f_state_short(m15_r) + " V:" + f_state_short(m15_v) +
-     " F:" + f_state_short(m15_f) + " RSI:" + m15_ri +
-     "  " + f_score_str(m15_score) + "  ← Navigator\n" +
-     "M5  " + f_arrow(filter_state) + " " +
+     "  R:" + _tn_mr + " V:" + _tn_mv +
+     " F:" + _tn_mf + " RSI:" + m15_ri +
+     "  " + _tn_ms + "  ← Navigator\n" +
+     "M5  " + _tn_f + " " +
      (m5_score>=2.5?"🟢":m5_score<=-2.5?"🔴":m5_score>0?"🟡":m5_score<0?"🟠":"⚪") +
-     "  R:" + f_state_short(m5_r) + " V:" + f_state_short(m5_v) +
-     " F:" + f_state_short(m5_f) + " RSI:" + m5_ri +
-     "  " + f_score_str(m5_score) + "  ← Exec layer\n" +
+     "  R:" + _tn_5r + " V:" + _tn_5v +
+     " F:" + _tn_5f + " RSI:" + m5_ri +
+     "  " + _tn_5s + "  ← Exec layer\n" +
      "──── " + str.tostring(total_score,"#.#") + "/15 · " +
-     f_score_word(total_score) + " · " + f_layer_line() + " ────\n" +
-     f_chain_synthesis(exec_state)
+     _tn_wd + " · " + _tn_ll + " ────\n" +
+     _tn_sy
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 21 — PIP TRACKER (DAILY RESET, ACTUAL vs EXPECTED)
@@ -2708,6 +2734,14 @@ _build_sl_autopsy() =>
 bool alert_liq_buy_sweep  = ta.crossover(close, ph_top)
 bool alert_liq_sell_sweep = ta.crossunder(close, pl_btm)
 
+// Pre-compute all v7.5 broadcast helpers (no nested function calls inline in strings)
+string _bc_ll    = f_layer_line()
+string _bc_sess  = f_session_short()
+string _bc_atr   = f_atr_ctx()
+string _bc_adv_b = f_ai_advice_v2(1)
+string _bc_adv_s = f_ai_advice_v2(-1)
+string _bc_sigcx = f_signal_context()
+
 bool trigger_signal = not silence_mode and (
      buy_signal_confirmed or sell_signal_confirmed or
      scale_in_buy or scale_in_sell or
@@ -2734,16 +2768,13 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
     // ── SILENCE BROADCAST ────────────────────────────────────────────────────
     if silence_broadcast
         event_title      := "🔇 STANDING ASIDE"
-        event_commentary :=
-             (atrHL == "Low" ?
-              "ATR LOW — compressed range. No setups until volatility expands.\n" +
-              "ATR: " + str.tostring(atrN,"#.#####") + " vs 20-bar avg." :
-              math.abs(total_score) < 3 ?
-              "Score " + str.tostring(total_score,"#.#") + "/15 — no dominant bias.\n" +
-              f_layer_line() + " — mixed trail state." :
-              "Operator silence active. Score: " + str.tostring(total_score,"#.#") + "/15.\n" +
-              f_layer_line() + " · " + pdh_pdl_status + ".") +
-             (admin_commentary != "" ? "\nNote: " + admin_commentary : "")
+        string _sil_body = atrHL == "Low" ?
+             "ATR LOW — compressed range. No setups until volatility expands.\nATR: " + str.tostring(atrN,"#.#####") + " vs 20-bar avg." :
+             math.abs(total_score) < 3 ?
+             "Score " + str.tostring(total_score,"#.#") + "/15 — no dominant bias.\n" + _bc_ll + " — mixed trail state." :
+             "Operator silence active. Score: " + str.tostring(total_score,"#.#") + "/15.\n" + _bc_ll + " · " + pdh_pdl_status + "."
+        string _sil_note = admin_commentary != "" ? "\nNote: " + admin_commentary : ""
+        event_commentary := _sil_body + _sil_note
 
     // ── STOP LOSS HIT ────────────────────────────────────────────────────────
     else if sl_alert_event
@@ -2831,20 +2862,10 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
                                                      "🟢 LONG"
         event_title := sync_tag_b
         int  n_agree_b = f_layers_count(1)
-        string chain_line_b =
-             f_layer_line() + " · " + str.tostring(n_agree_b,"#") + "/4 layers · Score " +
-             str.tostring(total_score,"#.#") + "/15 · " + f_session_short() + " · " + pdh_pdl_status
-        string sov_note_b   = sovereign_state == -1 ?
-             "D trail BEAR · " + str.tostring(n_agree_b,"#") + "/4 TF aligned · Counter-trend." :
-             sovereign_state == 1 ?
-             "D trail BULL · Sovereign confirmed." : "D trail flat · Local exec signal."
-        event_commentary :=
-             f_signal_context() + "\n" +
-             "Exec trail ↑ at " + _p(locked_entry) +
-             " · ATR trail: " + _pip_str(nLoss_buy) + " · " + f_atr_ctx() + "\n" +
-             chain_line_b + "\n" +
-             sov_note_b + "\n" +
-             f_ai_advice_v2(1)
+        string _nb_s = str.tostring(n_agree_b,"#")
+        string chain_line_b = _bc_ll + " · " + _nb_s + "/4 layers · Score " + str.tostring(total_score,"#.#") + "/15 · " + _bc_sess + " · " + pdh_pdl_status
+        string sov_note_b = sovereign_state == -1 ? "D trail BEAR · " + _nb_s + "/4 TF aligned · Counter-trend." : sovereign_state == 1 ? "D trail BULL · Sovereign confirmed." : "D trail flat · Local exec signal."
+        event_commentary := _bc_sigcx + "\nExec trail ↑ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_buy) + " · " + _bc_atr + "\n" + chain_line_b + "\n" + sov_note_b + "\n" + _bc_adv_b
 
     // ── SELL SIGNAL ──────────────────────────────────────────────────────────
     else if sell_signal_confirmed
@@ -2853,20 +2874,10 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
                                                      "🔴 SHORT"
         event_title := sync_tag_s
         int  n_agree_s = f_layers_count(-1)
-        string chain_line_s =
-             f_layer_line() + " · " + str.tostring(n_agree_s,"#") + "/4 layers · Score " +
-             str.tostring(total_score,"#.#") + "/15 · " + f_session_short() + " · " + pdh_pdl_status
-        string sov_note_s   = sovereign_state == 1 ?
-             "D trail BULL · " + str.tostring(n_agree_s,"#") + "/4 TF aligned · Counter-trend." :
-             sovereign_state == -1 ?
-             "D trail BEAR · Sovereign confirmed." : "D trail flat · Local exec signal."
-        event_commentary :=
-             f_signal_context() + "\n" +
-             "Exec trail ↓ at " + _p(locked_entry) +
-             " · ATR trail: " + _pip_str(nLoss_sell) + " · " + f_atr_ctx() + "\n" +
-             chain_line_s + "\n" +
-             sov_note_s + "\n" +
-             f_ai_advice_v2(-1)
+        string _ns_s = str.tostring(n_agree_s,"#")
+        string chain_line_s = _bc_ll + " · " + _ns_s + "/4 layers · Score " + str.tostring(total_score,"#.#") + "/15 · " + _bc_sess + " · " + pdh_pdl_status
+        string sov_note_s = sovereign_state == 1 ? "D trail BULL · " + _ns_s + "/4 TF aligned · Counter-trend." : sovereign_state == -1 ? "D trail BEAR · Sovereign confirmed." : "D trail flat · Local exec signal."
+        event_commentary := _bc_sigcx + "\nExec trail ↓ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_sell) + " · " + _bc_atr + "\n" + chain_line_s + "\n" + sov_note_s + "\n" + _bc_adv_s
 
     // ── SCALE-IN ─────────────────────────────────────────────────────────────
     else if scale_in_buy or scale_in_sell
@@ -2877,7 +2888,7 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
              "Adding " + _size_display(si_size) + " at " + _p(si_entry) + ".\n" +
              "Scale-in SL = original entry " + _p(locked_entry) + " (breakeven).\n" +
              "Original trade: SL " + _p(locked_sl) + " · TP3 " + _p(locked_tp3) + ".\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15 · " + f_session_short() + " · " + f_layer_line()
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · " + _bc_sess + " · " + _bc_ll
 
     // ── LIQUIDITY SWEEPS ─────────────────────────────────────────────────────
     else if alert_liq_buy_sweep
@@ -2942,10 +2953,10 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
              total_score > 2  and sovereign_state == 1  ?
              "Bullish setup favoured. Buy-liq "  + _p(ph_top) + " as first magnet. Watch M5 trail ↑." :
              "Mixed conditions at open. Waiting for score and trail to align before positioning."
+        string _so_line2 = "ATR " + _bc_atr + " · D " + _bc_ll + " · Score " + str.tostring(total_score,"#.#") + "/15"
         event_commentary :=
              current_session + " · " + pdh_pdl_status + "\n" +
-             "ATR " + f_atr_ctx() + " · D " + f_arrow(sovereign_state) +
-             " · Score " + str.tostring(total_score,"#.#") + "/15\n" +
+             _so_line2 + "\n" +
              poc_ctx_so + "\n" +
              "Buy-liq " + _p(ph_top) + " · Sell-liq " + _p(pl_btm) + "\n" +
              open_ctx_so + "\n" +
