@@ -1953,7 +1953,100 @@ f_ai_advice_v2(int direction) =>
     string _ac = f_atr_ctx()
     _sw + " alignment (" + str.tostring(math.abs(total_score), "#.#") + "/15) · " + sov_rel + " · " + _ac + _liq_sfx + " · " + pdh_pdl_status
 
-string ai_advice = f_ai_advice_v2(exec_state)
+f_state_emoji(string s) =>
+    s == "Long" or s == "Bull" ? "📈" : s == "Short" or s == "Bear" ? "📉" : "⚪"
+
+f_tf_verdict(string r, string v, string f, string ri, float sc) =>
+    bool rb   = r == "Long" or r == "Bull"
+    bool rd   = r == "Short" or r == "Bear"
+    bool vb   = v == "Bull"
+    bool vd   = v == "Bear"
+    bool fb   = f == "Bull"
+    bool fd   = f == "Bear"
+    bool rib  = ri == "Bull"
+    bool rid  = ri == "Bear"
+    int  bcnt = (rb?1:0) + (vb?1:0) + (fb?1:0)
+    int  dcnt = (rd?1:0) + (vd?1:0) + (fd?1:0)
+    string _rsi = rib ? " RSI confirming." : rid ? " RSI diverging." : ""
+    string out  = ""
+    if bcnt == 3
+        out := "Full alignment bullish." + _rsi
+    else if dcnt == 3
+        out := "Full alignment bearish." + _rsi
+    else if bcnt == 2 and dcnt == 1
+        string dis = rd ? "Regime" : vd ? "VWAP" : "Fib"
+        out := "Bullish. " + dis + " dissenting." + _rsi
+    else if bcnt == 2 and dcnt == 0
+        string dis = not rb ? "Regime" : not vb ? "VWAP" : "Fib"
+        out := "Bullish. " + dis + " flat — watch for convergence."
+    else if dcnt == 2 and bcnt == 1
+        string dis = rb ? "Regime" : vb ? "VWAP" : "Fib"
+        out := "Bearish. " + dis + " dissenting." + _rsi
+    else if dcnt == 2 and bcnt == 0
+        string dis = not rd ? "Regime" : not vd ? "VWAP" : "Fib"
+        out := "Bearish. " + dis + " flat — watch for convergence."
+    else
+        out := "Conflicted." + (rib ? " RSI leaning bull." : rid ? " RSI leaning bear." : " No lean.")
+    out
+
+f_ai_verdict(int direction) =>
+    int    n  = f_layers_count(direction)
+    bool   ct = sovereign_state != 0 and sovereign_state != direction
+    string dw = direction == 1 ? "long" : "short"
+    string l1 = ""
+    if n == 4
+        l1 := "Full 4-layer consensus " + dw + ". High-conviction."
+    else if n == 3 and ct
+        l1 := "3/4 aligned " + dw + ". D trail opposing — counter-trend."
+    else if n == 3
+        l1 := "3/4 aligned " + dw + ". One TF dissenting."
+    else if n == 2
+        l1 := "2/4 alignment. Exec fired — partial consensus."
+    else
+        l1 := "Weak consensus. Higher TFs not confirming."
+    string l2 = ""
+    if ct
+        l2 := "⚠️ TP1 max. No scale-in. Tight stop mandatory."
+    else if atrHL == "High" and n >= 3
+        l2 := "ATR HIGH — expanded range. TP3 viable. Trail with VWAP."
+    else if atrHL == "Low"
+        l2 := "ATR LOW — noise risk. Reduce size. TP1 focus."
+    else if n >= 3
+        l2 := "Standard R:R. Target TP2+. SL to entry at TP1."
+    else
+        l2 := "Reduced conviction. TP1 target. Re-assess."
+    string liq = ""
+    if direction == 1 and not na(ph_top)
+        liq := "First target: Buy-liq " + _p(ph_top) + " above."
+    else if direction == -1 and not na(pl_btm)
+        liq := "First target: Sell-liq " + _p(pl_btm) + " below."
+    l1 + "\n" + l2 + (liq != "" ? "\n" + liq : "")
+
+f_topdown_tg() =>
+    string _id  = sov_score>=2.5?"🟢":sov_score<=-2.5?"🔴":sov_score>0?"🟡":sov_score<0?"🟠":"⚪"
+    string _ih4 = h4_score>=2.5?"🟢":h4_score<=-2.5?"🔴":h4_score>0?"🟡":h4_score<0?"🟠":"⚪"
+    string _ih1 = h1_score>=2.5?"🟢":h1_score<=-2.5?"🔴":h1_score>0?"🟡":h1_score<0?"🟠":"⚪"
+    string _im  = m15_score>=2.5?"🟢":m15_score<=-2.5?"🔴":m15_score>0?"🟡":m15_score<0?"🟠":"⚪"
+    string _i5  = m5_score>=2.5?"🟢":m5_score<=-2.5?"🔴":m5_score>0?"🟡":m5_score<0?"🟠":"⚪"
+    string _vd  = f_tf_verdict(sov_r, sov_v, sov_f, sov_ri, sov_score)
+    string _vh4 = f_tf_verdict(h4_r,  h4_v,  h4_f,  h4_ri,  h4_score)
+    string _vh1 = f_tf_verdict(h1_r,  h1_v,  h1_f,  h1_ri,  h1_score)
+    string _vm  = f_tf_verdict(m15_r, m15_v, m15_f, m15_ri, m15_score)
+    string _v5  = f_tf_verdict(m5_r,  m5_v,  m5_f,  m5_ri,  m5_score)
+    string _sd  = f_score_str(sov_score)
+    string _sh4 = f_score_str(h4_score)
+    string _sh1 = f_score_str(h1_score)
+    string _sm  = f_score_str(m15_score)
+    string _s5  = f_score_str(m5_score)
+    string _sw  = f_score_word(total_score)
+    "D   " + _id  + " " + _sd  + " — " + _vd  + "\n" +
+    "H4  " + _ih4 + " " + _sh4 + " — " + _vh4 + "\n" +
+    "H1  " + _ih1 + " " + _sh1 + " — " + _vh1 + "\n" +
+    "M15 " + _im  + " " + _sm  + " — " + _vm  + "\n" +
+    "M5  " + _i5  + " " + _s5  + " — " + _v5  + "\n" +
+    "Score: " + str.tostring(total_score,"#.#") + "/15 — " + _sw + " alignment"
+
+string ai_advice = f_ai_verdict(exec_state)
 
 // ── CHAIN NARRATIVE (v7.5 format — arrows + scores + synthesis) ─────────────
 // Pre-compute all helper calls first (avoids CE10156 nested calls in strings)
@@ -1967,26 +2060,40 @@ _tree_row(string tf_tag, string r, string v, string f, string ri, float sc, bool
 string _tn_d  = f_arrow(sovereign_state)
 string _tn_a  = f_arrow(anchor_state)
 string _tn_f  = f_arrow(filter_state)
-string _tn_sr = f_state_short(sov_r)
-string _tn_sv = f_state_short(sov_v)
-string _tn_sf = f_state_short(sov_f)
-string _tn_hr = f_state_short(h4_r)
-string _tn_hv = f_state_short(h4_v)
-string _tn_hf = f_state_short(h4_f)
-string _tn_1r = f_state_short(h1_r)
-string _tn_1v = f_state_short(h1_v)
-string _tn_1f = f_state_short(h1_f)
-string _tn_mr = f_state_short(m15_r)
-string _tn_mv = f_state_short(m15_v)
-string _tn_mf = f_state_short(m15_f)
-string _tn_5r = f_state_short(m5_r)
-string _tn_5v = f_state_short(m5_v)
-string _tn_5f = f_state_short(m5_f)
+// Regime/VWAP/Fib as emoji (📈/📉/⚪) — replaces L/S/N text
+string _tn_sr = f_state_emoji(sov_r)
+string _tn_sv = f_state_emoji(sov_v)
+string _tn_sf = f_state_emoji(sov_f)
+string _tn_hr = f_state_emoji(h4_r)
+string _tn_hv = f_state_emoji(h4_v)
+string _tn_hf = f_state_emoji(h4_f)
+string _tn_1r = f_state_emoji(h1_r)
+string _tn_1v = f_state_emoji(h1_v)
+string _tn_1f = f_state_emoji(h1_f)
+string _tn_mr = f_state_emoji(m15_r)
+string _tn_mv = f_state_emoji(m15_v)
+string _tn_mf = f_state_emoji(m15_f)
+string _tn_5r = f_state_emoji(m5_r)
+string _tn_5v = f_state_emoji(m5_v)
+string _tn_5f = f_state_emoji(m5_f)
+// RSI as emoji per TF
+string _tn_sriE = f_state_emoji(sov_ri)
+string _tn_hriE = f_state_emoji(h4_ri)
+string _tn_1riE = f_state_emoji(h1_ri)
+string _tn_mriE = f_state_emoji(m15_ri)
+string _tn_5riE = f_state_emoji(m5_ri)
+// Score strings
 string _tn_ds = f_score_str(sov_score)
 string _tn_hs = f_score_str(h4_score)
 string _tn_1s = f_score_str(h1_score)
 string _tn_ms = f_score_str(m15_score)
 string _tn_5s = f_score_str(m5_score)
+// Per-TF verdict lines (top-down analysis)
+string _tn_vd   = f_tf_verdict(sov_r, sov_v, sov_f, sov_ri, sov_score)
+string _tn_vh4  = f_tf_verdict(h4_r,  h4_v,  h4_f,  h4_ri,  h4_score)
+string _tn_vh1  = f_tf_verdict(h1_r,  h1_v,  h1_f,  h1_ri,  h1_score)
+string _tn_vm15 = f_tf_verdict(m15_r, m15_v, m15_f, m15_ri, m15_score)
+string _tn_vm5  = f_tf_verdict(m5_r,  m5_v,  m5_f,  m5_ri,  m5_score)
 string _tn_wd = f_score_word(total_score)
 string _tn_ll = f_layer_line()
 string _tn_sy = f_chain_synthesis(exec_state)
@@ -1994,31 +2101,36 @@ string _tn_sy = f_chain_synthesis(exec_state)
 tree_narrative =
      "D  " + _tn_d + " " +
      (sov_score>=2.5?"🟢":sov_score<=-2.5?"🔴":sov_score>0?"🟡":sov_score<0?"🟠":"⚪") +
-     "  R:" + _tn_sr + " V:" + _tn_sv +
-     " F:" + _tn_sf + " RSI:" + sov_ri +
+     "  Regime:" + _tn_sr + " VWAP:" + _tn_sv +
+     " Fib:" + _tn_sf + " RSI:" + _tn_sriE +
      "  " + _tn_ds +
      ((sovereign_state==-1 and exec_state==1) or (sovereign_state==1 and exec_state==-1)
       ? "  [VETO]" : "  ← Sovereign") + "\n" +
+     "     → " + _tn_vd + "\n" +
      "H4    " +
      (h4_score>=2.5?"🟢":h4_score<=-2.5?"🔴":h4_score>0?"🟡":h4_score<0?"🟠":"⚪") +
-     "  R:" + _tn_hr + " V:" + _tn_hv +
-     " F:" + _tn_hf + " RSI:" + h4_ri +
+     "  Regime:" + _tn_hr + " VWAP:" + _tn_hv +
+     " Fib:" + _tn_hf + " RSI:" + _tn_hriE +
      "  " + _tn_hs + "\n" +
+     "     → " + _tn_vh4 + "\n" +
      "H1    " +
      (h1_score>=2.5?"🟢":h1_score<=-2.5?"🔴":h1_score>0?"🟡":h1_score<0?"🟠":"⚪") +
-     "  R:" + _tn_1r + " V:" + _tn_1v +
-     " F:" + _tn_1f + " RSI:" + h1_ri +
+     "  Regime:" + _tn_1r + " VWAP:" + _tn_1v +
+     " Fib:" + _tn_1f + " RSI:" + _tn_1riE +
      "  " + _tn_1s + "  ← Session bias\n" +
+     "     → " + _tn_vh1 + "\n" +
      "M15 " + _tn_a + " " +
      (m15_score>=2.5?"🟢":m15_score<=-2.5?"🔴":m15_score>0?"🟡":m15_score<0?"🟠":"⚪") +
-     "  R:" + _tn_mr + " V:" + _tn_mv +
-     " F:" + _tn_mf + " RSI:" + m15_ri +
+     "  Regime:" + _tn_mr + " VWAP:" + _tn_mv +
+     " Fib:" + _tn_mf + " RSI:" + _tn_mriE +
      "  " + _tn_ms + "  ← Navigator\n" +
+     "     → " + _tn_vm15 + "\n" +
      "M5  " + _tn_f + " " +
      (m5_score>=2.5?"🟢":m5_score<=-2.5?"🔴":m5_score>0?"🟡":m5_score<0?"🟠":"⚪") +
-     "  R:" + _tn_5r + " V:" + _tn_5v +
-     " F:" + _tn_5f + " RSI:" + m5_ri +
+     "  Regime:" + _tn_5r + " VWAP:" + _tn_5v +
+     " Fib:" + _tn_5f + " RSI:" + _tn_5riE +
      "  " + _tn_5s + "  ← Exec layer\n" +
+     "     → " + _tn_vm5 + "\n" +
      "──── " + str.tostring(total_score,"#.#") + "/15 · " +
      _tn_wd + " · " + _tn_ll + " ────\n" +
      _tn_sy
@@ -2668,12 +2780,13 @@ bool alert_liq_buy_sweep  = ta.crossover(close, ph_top)
 bool alert_liq_sell_sweep = ta.crossunder(close, pl_btm)
 
 // Pre-compute broadcast helpers (avoids CE10156 nested function calls in strings)
-string _bc_ll    = f_layer_line()
-string _bc_sess  = f_session_short()
-string _bc_atr   = f_atr_ctx()
-string _bc_adv_b = f_ai_advice_v2(1)
-string _bc_adv_s = f_ai_advice_v2(-1)
-string _bc_sigcx = f_signal_context()
+string _bc_ll       = f_layer_line()
+string _bc_sess     = f_session_short()
+string _bc_atr      = f_atr_ctx()
+string _bc_adv_b    = f_ai_verdict(1)
+string _bc_adv_s    = f_ai_verdict(-1)
+string _bc_sigcx    = f_signal_context()
+string _bc_topdown  = f_topdown_tg()
 
 bool trigger_signal = not silence_mode and (
      buy_signal_confirmed or sell_signal_confirmed or
@@ -2791,9 +2904,16 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
         event_title := sync_tag_b
         int   n_agree_b   = f_layers_count(1)
         string _nb_s      = str.tostring(n_agree_b,"#")
-        string chain_line_b = _bc_ll + " · " + _nb_s + "/4 layers · Score " + str.tostring(total_score,"#.#") + "/15 · " + _bc_sess + " · " + pdh_pdl_status
         string sov_note_b = sovereign_state == -1 ? "D trail BEAR · " + _nb_s + "/4 TF aligned · Counter-trend." : sovereign_state == 1 ? "D trail BULL · Sovereign confirmed." : "D trail flat · Local exec signal."
-        event_commentary := _bc_sigcx + "\nExec trail ↑ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_buy) + " · " + _bc_atr + "\n" + chain_line_b + "\n" + sov_note_b + "\n" + _bc_adv_b
+        event_commentary :=
+             _bc_sigcx + "\n" +
+             "Exec trail ↑ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_buy) + " · " + _bc_atr + "\n" +
+             sov_note_b + "\n" +
+             "──────────────────────────\n" +
+             "📐 TOP-DOWN\n" +
+             _bc_topdown + "\n" +
+             "──────────────────────────\n" +
+             "💡 " + _bc_adv_b
 
     // ── SELL SIGNAL ───────────────────────────────────────────────────────
     else if sell_signal_confirmed
@@ -2801,9 +2921,16 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
         event_title := sync_tag_s
         int   n_agree_s   = f_layers_count(-1)
         string _ns_s      = str.tostring(n_agree_s,"#")
-        string chain_line_s = _bc_ll + " · " + _ns_s + "/4 layers · Score " + str.tostring(total_score,"#.#") + "/15 · " + _bc_sess + " · " + pdh_pdl_status
         string sov_note_s = sovereign_state == 1 ? "D trail BULL · " + _ns_s + "/4 TF aligned · Counter-trend." : sovereign_state == -1 ? "D trail BEAR · Sovereign confirmed." : "D trail flat · Local exec signal."
-        event_commentary := _bc_sigcx + "\nExec trail ↓ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_sell) + " · " + _bc_atr + "\n" + chain_line_s + "\n" + sov_note_s + "\n" + _bc_adv_s
+        event_commentary :=
+             _bc_sigcx + "\n" +
+             "Exec trail ↓ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_sell) + " · " + _bc_atr + "\n" +
+             sov_note_s + "\n" +
+             "──────────────────────────\n" +
+             "📐 TOP-DOWN\n" +
+             _bc_topdown + "\n" +
+             "──────────────────────────\n" +
+             "💡 " + _bc_adv_s
 
     // ── LIQUIDITY SWEEPS ──────────────────────────────────────────────────
     else if alert_liq_buy_sweep
@@ -2872,24 +2999,28 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
              _poc_lv + "\n" +
              "Buy-liq " + _p(ph_top) + " · Sell-liq " + _p(pl_btm) + "\n" +
              open_ctx_so + "\n" +
-             "→ " + agenda_so
+             "→ " + agenda_so + "\n" +
+             "──────────────────────────\n" +
+             "📐 TOP-DOWN\n" +
+             _bc_topdown
 
     // ── TRADE PARAMETERS (entry signals only) ────────────────────────────
     string _tparams = ""
     if (buy_signal_confirmed or sell_signal_confirmed) and not na(locked_tp1)
         _tparams :=
              _sep + "\n" +
-             "Entry  " + _p(locked_entry) +
-             "    SL " + _p(locked_sl) +
-             " (" + _pip_str(locked_risk_dist) + " · $" + str.tostring(risk_per_trade,"#.##") + ")\n" +
-             "TP1    " + _p(locked_tp1) +
-             " (+" + _pip_str(math.abs(locked_tp1-locked_entry)) + " · 1:1)\n" +
-             "TP2    " + _p(locked_tp2) +
-             " (+" + _pip_str(math.abs(locked_tp2-locked_entry)) + " · 1.5:1)\n" +
-             "TP3    " + _p(locked_tp3) +
-             " (+" + _pip_str(math.abs(locked_tp3-locked_entry)) + " · 2:1)\n" +
-             "Size   " + _size_display(locked_position_size) +
-             " · ID " + atm_trade_id + "\n"
+             "🎯 TRADE\n" +
+             "Entry  │ " + _p(locked_entry) + "\n" +
+             "SL     │ " + _p(locked_sl) +
+             "  (" + _pip_str(locked_risk_dist) + " · $" + str.tostring(risk_per_trade,"#.##") + ")\n" +
+             "TP1    │ " + _p(locked_tp1) +
+             "  (+" + _pip_str(math.abs(locked_tp1-locked_entry)) + " · 1:1)\n" +
+             "TP2    │ " + _p(locked_tp2) +
+             "  (+" + _pip_str(math.abs(locked_tp2-locked_entry)) + " · 1.5:1)\n" +
+             "TP3    │ " + _p(locked_tp3) +
+             "  (+" + _pip_str(math.abs(locked_tp3-locked_entry)) + " · 2:1)\n" +
+             "Size   │ " + _size_display(locked_position_size) +
+             "  · ID " + atm_trade_id + "\n"
 
     // ── WAR ROOM MESSAGE ─────────────────────────────────────────────────
     string prem = ""
