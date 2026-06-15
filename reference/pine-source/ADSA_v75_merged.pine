@@ -3161,7 +3161,7 @@ if _daily_trigger
          "\n[/ATM_DATA_ADSA]"
 
     string _prem =
-         _SEP + "\n📊 ABSOLUTE DOLLAR SUPREME AGENT — DAILY REPORT\nADSA v7.0\n" + _SEP + "\n" +
+         _SEP + "\n📊 ABSOLUTE DOLLAR SUPREME AGENT — DAILY REPORT\nADSA v7.5\n" + _SEP + "\n" +
          "📅 " + str.tostring(year)+"-"+_pad(month)+"-"+_pad(dayofmonth) + "\n" +
          "📊 " + syminfo.ticker + " | TF: " + timeframe.period + "\n" +
          "📅 Daily: " + pdh_pdl_status + "\n" +

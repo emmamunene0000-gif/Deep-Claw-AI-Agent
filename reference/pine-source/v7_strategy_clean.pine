@@ -1865,17 +1865,98 @@ string effective_bias = admin_manual_bias == "FORCE BULL" ? "📡 ADMIN: FORCED 
      admin_manual_bias == "SILENCE"    ? "🔇 ADMIN: SILENCE — STANDING ASIDE" :
      master_bias
 
-string ai_advice = total_score >= 10 ? "Aggressive entry — 4-layer sovereign aligned." :
-     total_score >= 6  ? "Confident entry — bias confirmed. Verify chart." :
-     total_score >= 3  ? "Cautious entry — moderate alignment. Wait score > 6." :
-     total_score <= -10 ? "Aggressive short — 4-layer sovereign aligned." :
-     total_score <= -6  ? "Confident short — bearish bias confirmed." :
-     total_score <= -3  ? "Cautious short — wait score < -6." :
-     "Neutral. Stand aside. No edge present."
+// ── INTELLIGENCE FUNCTION SUITE (transplanted from v7.5) ─────────────────────
+f_arrow(int state) =>
+    state == 1 ? "↑" : state == -1 ? "↓" : "→"
 
-// ── [NEW v7.0] TREE NARRATIVE BUILDER ────────────────────────────────────────
-// Builds a ├── / │ / └── formatted tree row for a single timeframe layer.
-// score_icon: 🟢 when all 3 factors agree bull, 🔴 all agree bear, ⚪ mixed.
+f_score_str(float sc) =>
+    sc > 0 ? "+" + str.tostring(sc, "#.#") : str.tostring(sc, "#.#")
+
+f_layers_count(int direction) =>
+    int n = 0
+    if sovereign_state == direction
+        n += 1
+    if anchor_state == direction
+        n += 1
+    if filter_state == direction
+        n += 1
+    if exec_state == direction
+        n += 1
+    n
+
+f_layer_line() =>
+    "D" + f_arrow(sovereign_state) + " " + anchor_tf + "m" + f_arrow(anchor_state) + " " + filter_tf + "m" + f_arrow(filter_state) + " " + timeframe.period + "m" + f_arrow(exec_state)
+
+f_state_short(string s) =>
+    s == "Long" or s == "Bull" ? "L" : s == "Short" or s == "Bear" ? "S" : "N"
+
+f_score_word(float sc) =>
+    float a = math.abs(sc)
+    if a >= 10
+        "Strong"
+    else if a >= 6
+        "Majority"
+    else if a >= 3
+        "Partial"
+    else if a > 0
+        "Weak"
+    else
+        "Mixed"
+
+f_atr_ctx() =>
+    string ap = str.tostring(_pips(atrN), "#.#")
+    if atrHL == "High"
+        "ATR HIGH (" + ap + "p) · volatile"
+    else if atrHL == "Low"
+        "ATR LOW (" + ap + "p) · choppy range"
+    else
+        "ATR MED (" + ap + "p)"
+
+f_session_short() =>
+    if str.contains(current_session, "NY")
+        "NY"
+    else if str.contains(current_session, "LONDON")
+        "LDN"
+    else if str.contains(current_session, "TOKYO")
+        "TKO"
+    else
+        "OTC"
+
+f_liq_ctx() =>
+    string poc_str = vpEnabled and not na(vp_currentPOC) ? "POC " + _p(vp_currentPOC) + " · " : ""
+    poc_str + "Buy-liq " + _p(ph_top) + " · Sell-liq " + _p(pl_btm)
+
+f_chain_synthesis(int direction) =>
+    int   n  = f_layers_count(direction)
+    bool  ct = (direction == 1 and sovereign_state == -1) or
+               (direction == -1 and sovereign_state == 1)
+    string dw = direction == 1 ? "long" : "short"
+    if n == 4
+        "→ Full 4-layer alignment " + dw + ". Trail consensus across all TFs."
+    else if n == 3 and ct
+        "→ Local " + dw + " · 3/4 TF. D opposing — counter-trend. TP1 focus."
+    else if n == 3
+        "→ 3/4 layers aligned " + dw + ". One TF dissenting — watch for convergence."
+    else if n == 2
+        "→ Partial alignment (2/4). Exec fired but navigator/anchor not fully on board."
+    else
+        "→ Weak trail consensus. " + f_layer_line() + ". Exec signal only."
+
+f_ts() =>
+    str.format_time(time, "HH:mm", "UTC+0") + " UTC"
+
+f_ai_advice_v2(int direction) =>
+    string sov_rel = sovereign_state == direction ? "with D trail" : sovereign_state == 0 ? "D trail flat" : "against D trail"
+    string liq_note = direction == 1 and not na(ph_top) ? "Buy-liq " + _p(ph_top) + " above" : direction == -1 and not na(pl_btm) ? "Sell-liq " + _p(pl_btm) + " below" : ""
+    string _liq_sfx = liq_note != "" ? " · " + liq_note : ""
+    string _sw = f_score_word(total_score)
+    string _ac = f_atr_ctx()
+    _sw + " alignment (" + str.tostring(math.abs(total_score), "#.#") + "/15) · " + sov_rel + " · " + _ac + _liq_sfx + " · " + pdh_pdl_status
+
+string ai_advice = f_ai_advice_v2(exec_state)
+
+// ── CHAIN NARRATIVE (v7.5 format — arrows + scores + synthesis) ─────────────
+// Pre-compute all helper calls first (avoids CE10156 nested calls in strings)
 _tree_row(string tf_tag, string r, string v, string f, string ri, float sc, bool last_row) =>
     string icon = sc >= 2.5 ? "🟢" : sc <= -2.5 ? "🔴" : sc > 0 ? "🟡" : sc < 0 ? "🟠" : "⚪"
     string branch = last_row ? " └── " : " ├── "
@@ -1883,18 +1964,64 @@ _tree_row(string tf_tag, string r, string v, string f, string ri, float sc, bool
     branch + tf_tag + " " + icon + "\n" +
      pipe + "R:" + r + " V:" + v + " F:" + f + " RSI:" + ri + "\n"
 
-// Pre-build the 5-layer tree string (used in both dashboard and broadcast)
+string _tn_d  = f_arrow(sovereign_state)
+string _tn_a  = f_arrow(anchor_state)
+string _tn_f  = f_arrow(filter_state)
+string _tn_sr = f_state_short(sov_r)
+string _tn_sv = f_state_short(sov_v)
+string _tn_sf = f_state_short(sov_f)
+string _tn_hr = f_state_short(h4_r)
+string _tn_hv = f_state_short(h4_v)
+string _tn_hf = f_state_short(h4_f)
+string _tn_1r = f_state_short(h1_r)
+string _tn_1v = f_state_short(h1_v)
+string _tn_1f = f_state_short(h1_f)
+string _tn_mr = f_state_short(m15_r)
+string _tn_mv = f_state_short(m15_v)
+string _tn_mf = f_state_short(m15_f)
+string _tn_5r = f_state_short(m5_r)
+string _tn_5v = f_state_short(m5_v)
+string _tn_5f = f_state_short(m5_f)
+string _tn_ds = f_score_str(sov_score)
+string _tn_hs = f_score_str(h4_score)
+string _tn_1s = f_score_str(h1_score)
+string _tn_ms = f_score_str(m15_score)
+string _tn_5s = f_score_str(m5_score)
+string _tn_wd = f_score_word(total_score)
+string _tn_ll = f_layer_line()
+string _tn_sy = f_chain_synthesis(exec_state)
+
 tree_narrative =
-     " ├── D  (Sovereign) " + (sov_score>=2.5?"🟢":sov_score<=-2.5?"🔴":sov_score>0?"🟡":sov_score<0?"🟠":"⚪") + "\n" +
-     " │    Regime :" + sov_r + " V.WAP :" + sov_v + " Fib Trend :" + sov_f + " RSI:" + sov_ri + "\n" +
-     " ├── H4 (Anchor) "    + (h4_score>=2.5?"🟢":h4_score<=-2.5?"🔴":h4_score>0?"🟡":h4_score<0?"🟠":"⚪") + "\n" +
-     " │    Regime :" + h4_r  + " V.WAP :" + h4_v  + " Fib Trend :" + h4_f  + " RSI:" + h4_ri  + "\n" +
-     " ├── H1 "             + (h1_score>=2.5?"🟢":h1_score<=-2.5?"🔴":h1_score>0?"🟡":h1_score<0?"🟠":"⚪") + "\n" +
-     " │    Regime :" + h1_r  + " V.WAP :" + h1_v  + " Fib Trend :" + h1_f  + " RSI:" + h1_ri  + "\n" +
-     " ├── M15 "            + (m15_score>=2.5?"🟢":m15_score<=-2.5?"🔴":m15_score>0?"🟡":m15_score<0?"🟠":"⚪") + "\n" +
-     " │    Regime :" + m15_r + " V.WAP :" + m15_v + " Fib Trend :" + m15_f + " RSI:" + m15_ri + "\n" +
-     " └── M5 "             + (m5_score>=2.5?"🟢":m5_score<=-2.5?"🔴":m5_score>0?"🟡":m5_score<0?"🟠":"⚪") + "\n" +
-     "      Regime :" + m5_r  + " V.WAP :" + m5_v  + " Fib Trend :" + m5_f  + " RSI:" + m5_ri  + "\n"
+     "D  " + _tn_d + " " +
+     (sov_score>=2.5?"🟢":sov_score<=-2.5?"🔴":sov_score>0?"🟡":sov_score<0?"🟠":"⚪") +
+     "  R:" + _tn_sr + " V:" + _tn_sv +
+     " F:" + _tn_sf + " RSI:" + sov_ri +
+     "  " + _tn_ds +
+     ((sovereign_state==-1 and exec_state==1) or (sovereign_state==1 and exec_state==-1)
+      ? "  [VETO]" : "  ← Sovereign") + "\n" +
+     "H4    " +
+     (h4_score>=2.5?"🟢":h4_score<=-2.5?"🔴":h4_score>0?"🟡":h4_score<0?"🟠":"⚪") +
+     "  R:" + _tn_hr + " V:" + _tn_hv +
+     " F:" + _tn_hf + " RSI:" + h4_ri +
+     "  " + _tn_hs + "\n" +
+     "H1    " +
+     (h1_score>=2.5?"🟢":h1_score<=-2.5?"🔴":h1_score>0?"🟡":h1_score<0?"🟠":"⚪") +
+     "  R:" + _tn_1r + " V:" + _tn_1v +
+     " F:" + _tn_1f + " RSI:" + h1_ri +
+     "  " + _tn_1s + "  ← Session bias\n" +
+     "M15 " + _tn_a + " " +
+     (m15_score>=2.5?"🟢":m15_score<=-2.5?"🔴":m15_score>0?"🟡":m15_score<0?"🟠":"⚪") +
+     "  R:" + _tn_mr + " V:" + _tn_mv +
+     " F:" + _tn_mf + " RSI:" + m15_ri +
+     "  " + _tn_ms + "  ← Navigator\n" +
+     "M5  " + _tn_f + " " +
+     (m5_score>=2.5?"🟢":m5_score<=-2.5?"🔴":m5_score>0?"🟡":m5_score<0?"🟠":"⚪") +
+     "  R:" + _tn_5r + " V:" + _tn_5v +
+     " F:" + _tn_5f + " RSI:" + m5_ri +
+     "  " + _tn_5s + "  ← Exec layer\n" +
+     "──── " + str.tostring(total_score,"#.#") + "/15 · " +
+     _tn_wd + " · " + _tn_ll + " ────\n" +
+     _tn_sy
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 21 — PIP TRACKER (DAILY RESET, ACTUAL vs EXPECTED)
@@ -2069,8 +2196,206 @@ if dpt_active_idx >= 0 and dpt_active_idx < array.size(dpt_dir)
         dpt_active_idx := -1
 
 // ══════════════════════════════════════════════════════════════════════════════
+// SECTION 22.5 — SESSION MEMORY
+// Tracks score at session open and signal counts within the current VP session.
+// ══════════════════════════════════════════════════════════════════════════════
+var float  mem_session_open_score = na
+var string mem_session_open_bias  = ""
+var int    mem_session_sig_count  = 0
+var int    mem_session_sl_count   = 0
+var int    mem_session_tp_count   = 0
+var int    mem_session_start_bar  = 0
+var string mem_session_label      = ""
+
+if vp_newSession
+    mem_session_open_score := total_score
+    mem_session_open_bias  := effective_bias
+    mem_session_sig_count  := 0
+    mem_session_sl_count   := 0
+    mem_session_tp_count   := 0
+    mem_session_start_bar  := bar_index
+    mem_session_label      := str.contains(current_session,"NY")     ? "NY"  :
+                               str.contains(current_session,"LONDON") ? "LDN" : "TKO"
+
+if buy_signal_confirmed or sell_signal_confirmed
+    mem_session_sig_count := mem_session_sig_count + 1
+if sl_alert_event
+    mem_session_sl_count  := mem_session_sl_count + 1
+if tp1_alert_event or tp2_alert_event or tp3_alert_event
+    mem_session_tp_count  := mem_session_tp_count + 1
+
+// ══════════════════════════════════════════════════════════════════════════════
 // SECTION 23 — SUPREME AGENT DASHBOARD
 // ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 23.1 — MEMORY READING FUNCTIONS
+// All read existing dpt_* arrays — no new data collection.
+// ══════════════════════════════════════════════════════════════════════════════
+
+f_ep_result_str(int idx) =>
+    bool t1  = array.get(dpt_tp1_hit, idx)
+    bool t2  = array.get(dpt_tp2_hit, idx)
+    bool t3  = array.get(dpt_tp3_hit, idx)
+    bool sl  = array.get(dpt_sl_hit,  idx)
+    bool cur = idx == dpt_active_idx and trade_active
+    sl ? "SL" : t3 ? "TP3" : t2 ? "TP2" : t1 ? "TP1" : cur ? "OPEN" : "?"
+
+f_session_log() =>
+    int    n   = array.size(dpt_dir)
+    string log = ""
+    if n > 0
+        for i = 0 to n - 1
+            int    d    = array.get(dpt_dir,   i)
+            float  sc   = array.get(dpt_score, i)
+            string t    = array.get(dpt_type,  i)
+            string dir  = d == 1 ? "L" : "S"
+            string typ  = t == "SYNC4" ? "S4" : t == "COUNTER" ? "CT" : "LO"
+            string sc_s = sc > 0 ? "+" + str.tostring(sc,"#.#") : str.tostring(sc,"#.#")
+            string res  = f_ep_result_str(i)
+            log += str.tostring(i+1) + "." + dir + "[" + typ + "]" + sc_s + "→" + res + "  "
+    n == 0 ? "No signals yet today." : log
+
+f_signal_context() =>
+    int n = array.size(dpt_dir)
+    if n == 0
+        "First signal this session."
+    else
+        int    from_idx = math.max(0, n - 2)
+        string prior    = ""
+        for i = from_idx to n - 1
+            int    d   = array.get(dpt_dir,   i)
+            float  sc  = array.get(dpt_score, i)
+            string t   = array.get(dpt_type,  i)
+            string dir = d == 1 ? "L" : "S"
+            string typ = t == "SYNC4" ? "S4" : t == "COUNTER" ? "CT" : "LO"
+            string sc_s = sc > 0 ? "+" + str.tostring(sc,"#.#") : str.tostring(sc,"#.#")
+            string res  = f_ep_result_str(i)
+            prior += str.tostring(i+1) + "." + dir + "[" + typ + "]" + sc_s + "→" + res + "  "
+        "Signal #" + str.tostring(n+1) + " today · Prior: " + prior
+
+f_score_momentum() =>
+    if na(mem_session_open_score)
+        ""
+    else
+        float drift = total_score - mem_session_open_score
+        string arrow = drift > 2 ? "↑" : drift < -2 ? "↓" : "→"
+        string mag = math.abs(drift) > 6 ? " — structural shift" : math.abs(drift) > 3 ? " — bias strengthening" : ""
+        "Score " + arrow + " from " + str.tostring(mem_session_open_score,"#.#") + " at " + mem_session_label + " open (now " + str.tostring(total_score,"#.#") + mag + ")"
+
+f_ct_summary() =>
+    int n        = array.size(dpt_type)
+    int ct_total = 0
+    int ct_tp1   = 0
+    int ct_tp2   = 0
+    int ct_sl    = 0
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(dpt_type, i) == "COUNTER"
+                ct_total += 1
+                if array.get(dpt_tp1_hit, i)
+                    ct_tp1 += 1
+                if array.get(dpt_tp2_hit, i)
+                    ct_tp2 += 1
+                if array.get(dpt_sl_hit, i)
+                    ct_sl += 1
+    if ct_total == 0
+        ""
+    else
+        string _drag = ct_sl > ct_tp1 and ct_total >= 2 ? " [counter-trend drag active]" : ""
+        "CT today: " + str.tostring(ct_total) + " signal" + (ct_total > 1 ? "s" : "") + " · TP1 " + str.tostring(ct_tp1) + " · TP2 " + str.tostring(ct_tp2) + " · SL " + str.tostring(ct_sl) + _drag
+
+f_sync4_summary() =>
+    int n          = array.size(dpt_type)
+    int s4_total   = 0
+    int s4_tp2plus = 0
+    int s4_sl      = 0
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(dpt_type, i) == "SYNC4"
+                s4_total += 1
+                if array.get(dpt_tp2_hit, i) or array.get(dpt_tp3_hit, i)
+                    s4_tp2plus += 1
+                if array.get(dpt_sl_hit, i)
+                    s4_sl += 1
+    if s4_total == 0
+        ""
+    else
+        "Sync4 today: " + str.tostring(s4_total) + " · TP2+ " + str.tostring(s4_tp2plus) + " · SL " + str.tostring(s4_sl)
+
+f_live_assessment() =>
+    if dpt_total_sigs == 0
+        "No signals this session yet."
+    else
+        string _pf_s  = str.tostring(math.min(pip_pf,99.9),"#.##")
+        string _wr_s  = str.tostring(pip_win_rate,"##.#")
+        string _net_v = str.tostring(pip_net,"#.#")
+        string quality = pip_pf >= 2.0 and pip_win_rate >= 60.0 ? "Strong · PF " + _pf_s + " · WR " + _wr_s + "%" : pip_pf >= 1.5 ? "Good · PF " + _pf_s + " · WR " + _wr_s + "%" : pip_pf >= 1.0 ? "Positive · PF " + _pf_s : pip_losses > 0 and pip_wins == 0 ? "Difficult · 0 TP vs " + str.tostring(pip_losses) + " SL" : "Mixed · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
+        string net_s  = pip_net > 0 ? " · +" + _net_v + " " + pip_unit : pip_net < 0 ? " · " + _net_v + " " + pip_unit : ""
+        string vol_s  = dpt_total_sigs >= 5 ? " · High signal count (" + str.tostring(dpt_total_sigs) + ")" : ""
+        quality + net_s + vol_s
+
+f_avg_score_by_outcome() =>
+    int   n        = array.size(dpt_dir)
+    float tp_score = 0.0
+    float sl_score = 0.0
+    int   tp_n     = 0
+    int   sl_n     = 0
+    if n > 0
+        for i = 0 to n - 1
+            float sc = array.get(dpt_score, i)
+            bool  tp = array.get(dpt_tp1_hit, i)
+            bool  sl = array.get(dpt_sl_hit,  i)
+            if tp
+                tp_score += math.abs(sc)
+                tp_n     += 1
+            if sl
+                sl_score += math.abs(sc)
+                sl_n     += 1
+    if tp_n == 0 and sl_n == 0
+        ""
+    else
+        string _tp_avg = tp_n > 0 ? str.tostring(tp_score / tp_n,"#.#") : "—"
+        string _sl_avg = sl_n > 0 ? str.tostring(sl_score / sl_n,"#.#") : "—"
+        "Avg score: TP entries " + _tp_avg + "/15 · SL entries " + _sl_avg + "/15"
+
+f_daily_assessment() =>
+    int n        = array.size(dpt_type)
+    int ct_count = 0
+    int s4_count = 0
+    int lo_count = 0
+    if n > 0
+        for i = 0 to n - 1
+            string t = array.get(dpt_type, i)
+            if t == "COUNTER"
+                ct_count += 1
+            else if t == "SYNC4"
+                s4_count += 1
+            else
+                lo_count += 1
+    float ct_pct   = dpt_total_sigs > 0 ? (float(ct_count) / float(dpt_total_sigs)) * 100 : 0.0
+    string _pf_da  = str.tostring(math.min(pip_pf,99.9),"#.##")
+    string _wr_da  = str.tostring(pip_win_rate,"##.#")
+    string _net_da = str.tostring(pip_net,"#.#")
+    string assess  = ""
+    if dpt_total_sigs == 0
+        assess := "Zero signal session. Environment below threshold or operator silence active. Capital preserved."
+    else if pip_pf >= 2.0 and pip_win_rate >= 60.0
+        assess := "Strong session · PF " + _pf_da + " · WR " + _wr_da + "% · " + str.tostring(dpt_total_sigs) + " signals · " + str.tostring(pip_tp1_hits) + "×TP1 " + str.tostring(pip_tp2_hits) + "×TP2 " + str.tostring(pip_tp3_hits) + "×TP3 " + str.tostring(pip_losses) + "×SL"
+    else if pip_pf >= 1.0
+        assess := "Positive session · PF " + _pf_da + " · Net " + _net_da + " " + pip_unit + " · " + str.tostring(pip_wins) + "W / " + str.tostring(pip_losses) + "L"
+    else
+        assess := "Difficult session · PF " + _pf_da + " · " + str.tostring(pip_losses) + " SL vs " + str.tostring(pip_wins) + " TP · Net " + _net_da + " " + pip_unit
+    assess += "\nSignal mix: " + str.tostring(s4_count) + " Sync4 · " + str.tostring(lo_count) + " Local · " + str.tostring(ct_count) + " Counter-trend"
+    if ct_pct > 40.0 and dpt_total_sigs >= 3
+        assess += "\nCounter-trend represented " + str.tostring(ct_pct,"##.#") + "% of signals — review if CT drag is impacting net result."
+    string score_corr = f_avg_score_by_outcome()
+    if score_corr != ""
+        assess += "\n" + score_corr
+    string momentum = f_score_momentum()
+    if momentum != ""
+        assess += "\n" + momentum
+    assess
 
 // ── [NEW v7.0] LIVE P&L COMPUTATION ─────────────────────────────────────────
 // Computed per bar. Only meaningful when is_trade_running = true and locked_entry is set.
@@ -2126,6 +2451,14 @@ if dashOn and not na(dashTable) and barstate.islast
     string wr_ds = pip_total_signals > 0 ? str.tostring(pip_win_rate,"##.#") + "%" : "—"
     string net_ds = pip_net >= 0 ? "+" + str.tostring(pip_net,"#.#") : str.tostring(pip_net,"#.#")
 
+    // Pre-compute memory strings (avoids CE10156)
+    string _d_assess = f_live_assessment()
+    string _d_ct     = f_ct_summary()
+    string _d_s4     = f_sync4_summary()
+    string _d_smom   = f_score_momentum()
+    string _d_ascore = f_avg_score_by_outcome()
+    string _d_eplog  = f_session_log()
+
     string panelText =
          " 🚀 ABSOLUTE DOLLAR AGENT" + D +
          " Absolute Dollar Intelligence" + D +
@@ -2174,6 +2507,16 @@ if dashOn and not na(dashTable) and barstate.islast
          " WR: " + wr_ds + "  PF: " + pf_ds + "  Net: " + net_ds + " " + pip_unit + D +
          " Report: " + (dpt_report_sent ? "✅ SENT" : "⏳ " + str.tostring(report_hour_utc) + ":00 UTC") + D +
          L +
+         " 📊 SESSION" + D +
+         " " + _d_assess + D +
+         (_d_ct != "" ? " " + _d_ct + D : "") +
+         (_d_s4 != "" ? " " + _d_s4 + D : "") +
+         (_d_smom != "" ? " " + _d_smom + D : "") +
+         (_d_ascore != "" ? " " + _d_ascore + D : "") +
+         " ─────────────────────────────" + D +
+         " 📋 EPISODE LOG" + D +
+         " " + _d_eplog + D +
+         " ─────────────────────────────" + D +
          " ⚠️ Not financial advice." + D +
          " © Absolute Dollar 2026"
 
@@ -2262,29 +2605,59 @@ if showPerfPanel and not na(perfTable) and barstate.islast
     table.cell(perfTable,3,8,str.tostring(pip_wins)+"W/"+str.tostring(pip_losses)+"L",text_color=PT_MUTED,text_size=size.small,bgcolor=PT_RB,text_halign=text.align_center)
     table.cell(perfTable,4,8,"DAILY RESET",    text_color=PT_MUTED,text_size=size.tiny, bgcolor=PT_RB,text_halign=text.align_center)
 
-    table.cell(perfTable,0,9,"ABSOLUTE DOLLAR INTELLIGENCE", text_color=PT_GOLD, text_size=size.small,bgcolor=PT_HDR,text_halign=text.align_left)
-    table.cell(perfTable,1,9,"",bgcolor=PT_HDR)
-    table.cell(perfTable,2,9,"SUPREME AGENT — ADSA v7.0", text_color=PT_MUTED,text_size=size.small,bgcolor=PT_HDR,text_halign=text.align_center)
-    table.cell(perfTable,3,9,"",bgcolor=PT_HDR)
-    table.cell(perfTable,4,9,"© 2026", text_color=PT_MUTED,text_size=size.small,bgcolor=PT_HDR,text_halign=text.align_right)
+    string _assess_row9 = f_live_assessment()
+    string _ct_row9     = f_ct_summary()
+    table.cell(perfTable, 0, 9,
+         dpt_total_sigs > 0 ? _assess_row9 : "Waiting for first signal...",
+         text_color = pip_net >= 0 ? color.new(#89d185,255) : color.new(#f48771,255),
+         text_size  = size.small, bgcolor = PT_HDR, text_halign = text.align_left)
+    table.cell(perfTable, 1, 9, "", bgcolor=PT_HDR)
+    table.cell(perfTable, 2, 9,
+         _ct_row9 != "" ? _ct_row9 : "ADSA v7.0",
+         text_color = PT_MUTED, text_size = size.small,
+         bgcolor = PT_HDR, text_halign = text.align_center)
+    table.cell(perfTable, 3, 9, "", bgcolor=PT_HDR)
+    table.cell(perfTable, 4, 9, "© 2026",
+         text_color = PT_MUTED, text_size = size.small,
+         bgcolor = PT_HDR, text_halign = text.align_right)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 25 — SL AUTOPSY ENGINE
 // ══════════════════════════════════════════════════════════════════════════════
 _build_sl_autopsy() =>
-    string out = "STRUCTURAL INVALIDATION. Market invalidated the structural premise of this trade."
-    if str.contains(liq_bias,"BREAKING")
-        out := "LIQUIDITY TRAP: Institutions swept our stop to collect resting orders. Zone was structurally correct — sweep depth exceeded the ATR buffer. Next time: widen buffer or wait for sweep confirmation before entry."
+    string out = ""
+    if (sovereign_state == -1 and trade_direction == 1) or
+       (sovereign_state == 1  and trade_direction == -1)
+        string sov_dir   = sovereign_state == -1 ? "BEARISH" : "BULLISH"
+        string trade_dir = trade_direction  == 1 ? "long"    : "short"
+        string _a1 = "COUNTER-TREND: D trail was " + sov_dir + " at entry.\n" + trade_dir + " entered against sovereign structure."
+        string _a2 = "\nExec TF confirmed — macro structure reasserted before target."
+        string _a3 = "\nScore at entry: " + str.tostring(total_score,"#.#") + "/15 · Peak: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "."
+        out := _a1 + _a2 + _a3
+    else if str.contains(liq_bias,"BREAKING")
+        string swept = str.contains(liq_bias,"HIGH") ? "buy-side" : "sell-side"
+        string _b1 = "LIQ ZONE SWEEP: Stop was at/near the " + swept + " pool."
+        string _b2 = "\nPrice swept beyond the pool before reversing."
+        string _b3 = "\nSL buffer (" + str.tostring(sl_buffer_atr,"#.#") + " ATR) did not clear the sweep depth."
+        string _b4 = "\nConsider placing SL beyond the zone rather than at it."
+        out := _b1 + _b2 + _b3 + _b4
     else if atrHL == "Low"
-        out := "VOLATILITY COLLAPSE: ATR entered LOW state. Stop was not wide enough to survive noise in thin conditions. RULE: Do NOT enter when ATR = Low."
-    else if sovereign_state == -1 and trade_direction == 1
-        out := "SOVEREIGN VETO: Daily was BEARISH at entry. Counter-trend long against macro structure. RULE: Counter-trend = TP1 only. Never TP3. Structural probability was already discounted."
-    else if sovereign_state == 1 and trade_direction == -1
-        out := "SOVEREIGN VETO: Daily was BULLISH at entry. Counter-trend short. RULE: Exit at TP1, do not press into full 2:1."
+        string _c1 = "LOW ATR: Volatility was compressed at stop time."
+        string _c2 = "\nATR: " + str.tostring(atrN,"#.#####") + " · SL distance was " + _pip_str(locked_risk_dist) + " (" + str.tostring(sl_buffer_atr,"#.#") + " ATR buffer)."
+        string _c3 = "\nIn low-ATR conditions, small noise moves can clip stops. Widening SL buffer or reducing size reduces this risk."
+        out := _c1 + _c2 + _c3
     else if math.abs(total_score) < 4
-        out := "WEAK 5-LAYER ALIGNMENT: Score below threshold. Score = " + str.tostring(total_score,"#.#") + "/15. Partial alignment produced a false signal. RULE: Never enter when abs(score) < 4."
+        float agree_tfs = math.round((math.abs(total_score) / 3.0))
+        string _d1 = "WEAK ALIGNMENT: Score " + str.tostring(total_score,"#.#") + "/15 at entry."
+        string _d2 = "\nApproximately " + str.tostring(agree_tfs,"#") + "/5 TF layers agreed."
+        string _d3 = "\nPartial alignment entries carry higher invalidation risk. Exec TF fired but higher TFs had not confirmed direction."
+        out := _d1 + _d2 + _d3
     else
-        out := "MACRO ROTATION: Higher-TF structure shifted post-entry. Trade was structurally valid — context rotated against us. Review session timing as a contributing factor."
+        string _e1 = "NO DOMINANT PATTERN: Trade structure was valid at entry."
+        string _e2 = "\nScore: " + str.tostring(total_score,"#.#") + "/15 · ATR: " + atrHL + " · Session: " + current_session
+        string _e3 = "\nPeak before stop: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "."
+        string _e4 = "\nLogged for pattern accumulation. No parameter change recommended."
+        out := _e1 + _e2 + _e3 + _e4
     out
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2293,6 +2666,14 @@ _build_sl_autopsy() =>
 
 bool alert_liq_buy_sweep  = ta.crossover(close, ph_top)
 bool alert_liq_sell_sweep = ta.crossunder(close, pl_btm)
+
+// Pre-compute broadcast helpers (avoids CE10156 nested function calls in strings)
+string _bc_ll    = f_layer_line()
+string _bc_sess  = f_session_short()
+string _bc_atr   = f_atr_ctx()
+string _bc_adv_b = f_ai_advice_v2(1)
+string _bc_adv_s = f_ai_advice_v2(-1)
+string _bc_sigcx = f_signal_context()
 
 bool trigger_signal = not silence_mode and (
      buy_signal_confirmed or sell_signal_confirmed or
@@ -2307,249 +2688,269 @@ bool silence_broadcast = silence_mode and vp_newSession
 
 if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadcast)
 
-    string sl_autopsy = _build_sl_autopsy()
-    string _sym       = syminfo.ticker + " | " + timeframe.period
+    string sl_autopsy  = _build_sl_autopsy()
+    string _sym        = syminfo.ticker + " | " + timeframe.period
+    string _ts         = f_ts()
+    string _sep        = "──────────────────────────"
+    string _ticker_line = syminfo.ticker + " " + timeframe.period + " · " + _ts
 
-    string event_title = ""
+    string event_title      = ""
     string event_commentary = ""
 
+    // ── SILENCE ──────────────────────────────────────────────────────────
     if silence_broadcast
-        event_title       := "🔇 ADMIN SILENCE — STANDING ASIDE"
-        event_commentary  := atrHL == "Low" ? "⚠️ LOW VOLATILITY — chopzone active. No setups until ATR expands." :
-             math.abs(total_score) < 3 ? "⚠️ MIXED ALIGNMENT — Score: " + str.tostring(total_score,"#.#") + "/15. Conditions unclear." :
-             "Operator discretion active. Monitoring only."
-        if admin_commentary != ""
-            event_commentary += "\n💬 OPERATOR NOTE: " + admin_commentary
+        event_title      := "🔇 STANDING ASIDE"
+        string _sil_body  = ""
+        if atrHL == "Low"
+            _sil_body := "ATR LOW — compressed range. No setups until volatility expands.\nATR: " + str.tostring(atrN,"#.#####") + " vs 20-bar avg."
+        else if math.abs(total_score) < 3
+            _sil_body := "Score " + str.tostring(total_score,"#.#") + "/15 — no dominant bias.\n" + _bc_ll + " — mixed trail state."
+        else
+            _sil_body := "Operator silence active. Score: " + str.tostring(total_score,"#.#") + "/15.\n" + _bc_ll + " · " + pdh_pdl_status + "."
+        string _sil_note  = admin_commentary != "" ? "\nNote: " + admin_commentary : ""
+        event_commentary := _sil_body + _sil_note
 
+    // ── STOP LOSS HIT ─────────────────────────────────────────────────────
     else if sl_alert_event
-        event_title      := "💀 STOP HIT — GLASS BOX AUTOPSY"
-        event_commentary := "🔬 " + sl_autopsy + "\n" +
-             "Peak before stop: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "\n" +
-             "Min-unit loss est.: ~$" + str.tostring(locked_actual_risk,"#.##") + "\n" +
-             "Score at entry: " + str.tostring(total_score,"#.#") + "/15\n" +
-             "Every loss is data. Reassessing now."
+        event_title      := "💀 SL HIT"
+        event_commentary :=
+             str.tostring(math.abs(_pips(locked_risk_dist)),"#.##") + " " + pip_unit +
+             " · −$" + str.tostring(locked_actual_risk,"#.##") +
+             " · ID " + atm_trade_id + "\n" +
+             "Peak before stop: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit +
+             " · Score at entry: " + str.tostring(total_score,"#.#") + "/15\n" +
+             _sep + "\n" +
+             sl_autopsy
 
+    // ── HOLDER MODE EXIT ──────────────────────────────────────────────────
     else if holder_exit_event
-        event_title      := "🏁 HOLDER MODE EXIT — VWAP CROSSED"
-        event_commentary := "Direction: " + (trade_direction==1?"LONG":"SHORT") + "\n" +
-             "VWAP Trail crossed: " + _p(vap_current) + "\n" +
-             "Peak run: " + str.tostring(max_profit_pips,"#.##") + " " + pip_unit + "\n" +
-             "Protocol: Close remaining position. Swing leg exhausted."
+        event_title      := "🏁 HOLDER EXIT"
+        string dir_word   = trade_direction == 1 ? "Long" : "Short"
+        event_commentary :=
+             dir_word + " · VWAP trail crossed at " + _p(vap_current) + "\n" +
+             "Swing leg complete. Peak run: " +
+             str.tostring(max_profit_pips,"#.##") + " " + pip_unit + ".\n" +
+             "Remaining position closed. Trade concluded."
 
+    // ── TP3 HIT ───────────────────────────────────────────────────────────
     else if tp3_alert_event
-        event_title      := "🚀 TP3 HIT — HOLDER MODE ACTIVATED (2:1)"
-        event_commentary := "Close 75% at TP3 (" + _p(locked_tp3) + ").\n" +
-             "Trail 25% using Adaptive VWAP: " + _p(vap_current) + "\n" +
-             "Exit fires when price crosses back through VWAP."
+        event_title      := "🚀 TP3 HIT (2:1)"
+        event_commentary :=
+             "+" + str.tostring(_pips(math.abs(locked_tp3-locked_entry)),"#.##") + " " + pip_unit +
+             " · 2:1 · ID " + atm_trade_id + "\n" +
+             "75% closed at " + _p(locked_tp3) + ".\n" +
+             "Holder mode: trailing 25% via VWAP at " + _p(vap_current) + ".\n" +
+             "Exit fires on VWAP cross-back."
 
+    // ── TP2 HIT ───────────────────────────────────────────────────────────
     else if tp2_alert_event
-        event_title      := "🎯🎯 TP2 HIT — MOVE STOP TO BREAKEVEN (1.5:1)"
-        event_commentary := "Take 50% off the position.\n" +
-             "Move SL to entry: " + _p(locked_entry) + "\n" +
-             "Position is now RISK-FREE. Hunting TP3 at " + _p(locked_tp3) + "."
+        event_title      := "🎯🎯 TP2 HIT (1.5:1)"
+        event_commentary :=
+             "+" + str.tostring(_pips(math.abs(locked_tp2-locked_entry)),"#.##") + " " + pip_unit +
+             " · 1.5:1 · ID " + atm_trade_id + "\n" +
+             "50% off at " + _p(locked_tp2) + ".\n" +
+             "SL → entry: " + _p(locked_entry) + ". Position now risk-free.\n" +
+             "Next: TP3 at " + _p(locked_tp3) + " (+" +
+             str.tostring(_pips(math.abs(locked_tp3-locked_entry)),"#.##") + "p · 2:1)."
 
+    // ── TP1 HIT ───────────────────────────────────────────────────────────
     else if tp1_alert_event
-        event_title      := "🎯 TP1 HIT — PARTIAL SECURED (1:1)"
-        event_commentary := "Take 25–33% off. Tighten SL toward entry.\n" +
-             "Next target: TP2 at " + _p(locked_tp2) + "."
+        event_title      := "🎯 TP1 HIT (1:1)"
+        event_commentary :=
+             "+" + str.tostring(_pips(math.abs(locked_tp1-locked_entry)),"#.##") + " " + pip_unit +
+             " · 1:1 · ID " + atm_trade_id + "\n" +
+             "25–33% off at " + _p(locked_tp1) + ".\n" +
+             "Tighten SL toward entry. Next: TP2 at " + _p(locked_tp2) + " (+" +
+             str.tostring(_pips(math.abs(locked_tp2-locked_entry)),"#.##") + "p · 1.5:1)."
 
+    // ── REGIME REJECTION ──────────────────────────────────────────────────
     else if rejection_alert
-        event_title      := "⛔ SIGNAL BLOCKED — REGIME FILTER"
-        event_commentary := buy_rejected ?
-             "LONG blocked. Sovereign: " + sovereignStatus + " | Score: " + str.tostring(total_score,"#.#") + "/15\n" +
-             "RSI/VWAP/Regime misaligned. Silence = a position." :
-             "SHORT blocked. Sovereign: " + sovereignStatus + " | Score: " + str.tostring(total_score,"#.#") + "/15\n" +
-             "Counter-trend entries fail more. Waiting for alignment."
+        event_title      := "⛔ BLOCKED"
+        bool  is_long     = buy_rejected
+        string dir_word_r = is_long ? "LONG" : "SHORT"
+        string rsi_val_s  = str.tostring(rsi, "#.#")
+        bool  rsi_fail    = is_long ? not (rsi > pmom) : not (rsi < nmom)
+        bool  vwap_fail   = is_long ? not vwapBullish  : not vwapBearish
+        string _pmom_s    = str.tostring(pmom,"#")
+        string _nmom_s    = str.tostring(nmom,"#")
+        string rsi_note   = rsi_fail ? "RSI " + rsi_val_s + (is_long ? " < " + _pmom_s + " (bull threshold)" : " > " + _nmom_s + " (bear threshold)") : ""
+        string vwap_note  = vwap_fail ? "VWAP: price " + (is_long ? "below" : "above") + " " + _p(vap_current) : ""
+        string failed     = rsi_fail and vwap_fail ? rsi_note + " · " + vwap_note : rsi_fail ? rsi_note : vwap_note
+        string _rsi_need  = is_long ? "RSI > " + _pmom_s : "RSI < " + _nmom_s
+        string _vw_dir    = is_long ? "above" : "below"
+        string needs      = rsi_fail and vwap_fail ? _rsi_need + " AND price " + _vw_dir + " VWAP" : rsi_fail ? _rsi_need : "Price " + _vw_dir + " VWAP " + _p(vap_current)
+        event_commentary :=
+             "Trail flipped " + dir_word_r + " — regime gate rejected.\n" +
+             "Failed: " + failed + "\n" +
+             "Needs: " + needs + " to clear.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Sovereign: " + sovereignStatus
 
+    // ── BUY SIGNAL ────────────────────────────────────────────────────────
     else if buy_signal_confirmed
-        event_title := master_sync_buy       ? "🔥 MASTER SYNC LONG — 4-LAYER ALIGNED" :
-             sovereign_counter_buy ? "⚠️ SOVEREIGN COUNTER-TREND LONG"     :
-             "🟢 LONG SIGNAL CONFIRMED"
-        event_commentary := master_sync_buy ?
-             "All 4 layers BULLISH. Sovereign + Commander + Navigator + Executor aligned.\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15 | ATR: " + atrHL + "\n" +
-             "High-probability trend continuation. R:R 2.0+ advised." :
-             sovereign_counter_buy ?
-             "⚠️ Daily is BEARISH. Counter-trend long.\n" +
-             "RULE: Target TP1 only. Do NOT hold to TP3.\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15" :
-             "Local alignment confirmed. Sovereign: " + sovereignStatus + "\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15 | " + ai_advice
+        string sync_tag_b = master_sync_buy ? "🔥 MASTER SYNC LONG" : sovereign_counter_buy ? "⚠️ COUNTER-TREND LONG" : "🟢 LONG"
+        event_title := sync_tag_b
+        int   n_agree_b   = f_layers_count(1)
+        string _nb_s      = str.tostring(n_agree_b,"#")
+        string chain_line_b = _bc_ll + " · " + _nb_s + "/4 layers · Score " + str.tostring(total_score,"#.#") + "/15 · " + _bc_sess + " · " + pdh_pdl_status
+        string sov_note_b = sovereign_state == -1 ? "D trail BEAR · " + _nb_s + "/4 TF aligned · Counter-trend." : sovereign_state == 1 ? "D trail BULL · Sovereign confirmed." : "D trail flat · Local exec signal."
+        event_commentary := _bc_sigcx + "\nExec trail ↑ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_buy) + " · " + _bc_atr + "\n" + chain_line_b + "\n" + sov_note_b + "\n" + _bc_adv_b
 
+    // ── SELL SIGNAL ───────────────────────────────────────────────────────
     else if sell_signal_confirmed
-        event_title := master_sync_sell       ? "🥶 MASTER SYNC SHORT — 4-LAYER ALIGNED" :
-             sovereign_counter_sell ? "⚠️ SOVEREIGN COUNTER-TREND SHORT"    :
-             "🔴 SHORT SIGNAL CONFIRMED"
-        event_commentary := master_sync_sell ?
-             "All 4 layers BEARISH. Sovereign + Commander + Navigator + Executor aligned.\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15 | ATR: " + atrHL + "\n" +
-             "High-probability trend continuation. R:R 2.0+ advised." :
-             sovereign_counter_sell ?
-             "⚠️ Daily is BULLISH. Counter-trend short.\n" +
-             "RULE: Target TP1 only. Do NOT hold to TP3.\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15" :
-             "Local alignment confirmed. Sovereign: " + sovereignStatus + "\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15 | " + ai_advice
+        string sync_tag_s = master_sync_sell ? "🥶 MASTER SYNC SHORT" : sovereign_counter_sell ? "⚠️ COUNTER-TREND SHORT" : "🔴 SHORT"
+        event_title := sync_tag_s
+        int   n_agree_s   = f_layers_count(-1)
+        string _ns_s      = str.tostring(n_agree_s,"#")
+        string chain_line_s = _bc_ll + " · " + _ns_s + "/4 layers · Score " + str.tostring(total_score,"#.#") + "/15 · " + _bc_sess + " · " + pdh_pdl_status
+        string sov_note_s = sovereign_state == 1 ? "D trail BULL · " + _ns_s + "/4 TF aligned · Counter-trend." : sovereign_state == -1 ? "D trail BEAR · Sovereign confirmed." : "D trail flat · Local exec signal."
+        event_commentary := _bc_sigcx + "\nExec trail ↓ at " + _p(locked_entry) + " · ATR trail: " + _pip_str(nLoss_sell) + " · " + _bc_atr + "\n" + chain_line_s + "\n" + sov_note_s + "\n" + _bc_adv_s
 
+    // ── LIQUIDITY SWEEPS ──────────────────────────────────────────────────
     else if alert_liq_buy_sweep
-        event_title      := "⚠️ BUY-SIDE LIQUIDITY SWEPT"
-        event_commentary := "Pool at " + _p(ph_top) + " has been swept.\n" +
-             "FALSE BREAK → Reversal long incoming. Wait for CHoCH on lower TF.\n" +
-             "BREAKOUT    → Continuation above. Wait for retest.\n" +
-             "Structure: " + (swingTrend.bias==BULLISH?"Bullish":"Bearish") + " | Do not react immediately."
+        event_title      := "⚡ BUY-SIDE LIQ SWEPT"
+        string score_lean_b = total_score < -2 ? "Bearish score lean → false-break probability elevated." : total_score > 2 ? "Bullish score lean → breakout continuation possible." : "Neutral score — no lean. Outcome open."
+        event_commentary :=
+             "Pool at " + _p(ph_top) + " swept.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Structure: " +
+             (swingTrend.bias==BULLISH?"Bullish swing":"Bearish swing") + "\n" +
+             score_lean_b + "\n" +
+             "Wait for exec trail confirmation before positioning. Do not react to sweep alone."
 
     else if alert_liq_sell_sweep
-        event_title      := "⚠️ SELL-SIDE LIQUIDITY SWEPT"
-        event_commentary := "Pool at " + _p(pl_btm) + " has been swept.\n" +
-             "FALSE BREAK → Reversal short incoming. Wait for CHoCH.\n" +
-             "BREAKDOWN   → Continuation below. Wait for retest.\n" +
-             "Structure: " + (swingTrend.bias==BULLISH?"Bullish":"Bearish") + " | Do not react immediately."
+        event_title      := "⚡ SELL-SIDE LIQ SWEPT"
+        string score_lean_s = total_score > 2 ? "Bullish score lean → false-break probability elevated." : total_score < -2 ? "Bearish score lean → breakdown continuation possible." : "Neutral score — no lean. Outcome open."
+        event_commentary :=
+             "Pool at " + _p(pl_btm) + " swept.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Structure: " +
+             (swingTrend.bias==BULLISH?"Bullish swing":"Bearish swing") + "\n" +
+             score_lean_s + "\n" +
+             "Wait for exec trail confirmation before positioning. Do not react to sweep alone."
 
+    // ── STRUCTURE SHIFTS ──────────────────────────────────────────────────
     else if currentAlerts.swingBullishBOS or currentAlerts.swingBullishCHoCH
-        event_title      := "📈 BULLISH STRUCTURE SHIFT (BOS/CHoCH)"
-        event_commentary := "Sellers are losing control. Scanning for discount pullback entries.\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15 | Liq: " + liq_bias
+        string struct_type_b = currentAlerts.swingBullishBOS ? "BOS" : "CHoCH"
+        event_title        := "📈 BULL STRUCTURE SHIFT (" + struct_type_b + ")"
+        event_commentary   :=
+             "Swing " + struct_type_b + " confirmed bullish.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Liq: " + liq_bias + "\n" +
+             "Context update — not an entry signal.\n" +
+             "Exec trail flip required to generate a trade signal."
 
     else if currentAlerts.swingBearishBOS or currentAlerts.swingBearishCHoCH
-        event_title      := "📉 BEARISH STRUCTURE SHIFT (BOS/CHoCH)"
-        event_commentary := "Buyers are losing control. Scanning for premium pullback entries.\n" +
-             "Score: " + str.tostring(total_score,"#.#") + "/15 | Liq: " + liq_bias
+        string struct_type_s = currentAlerts.swingBearishBOS ? "BOS" : "CHoCH"
+        event_title        := "📉 BEAR STRUCTURE SHIFT (" + struct_type_s + ")"
+        event_commentary   :=
+             "Swing " + struct_type_s + " confirmed bearish.\n" +
+             "Score: " + str.tostring(total_score,"#.#") + "/15 · Liq: " + liq_bias + "\n" +
+             "Context update — not an entry signal.\n" +
+             "Exec trail flip required to generate a trade signal."
 
+    // ── SESSION OPEN ──────────────────────────────────────────────────────
     else if vp_newSession
-        event_title      := "🕒 SESSION OPEN — ENVIRONMENTAL SCAN"
-        event_commentary := current_session + "\n" +
-             (atrHL=="Low"      ? "⚠️ LOW VOLATILITY: No signals until ATR expands." :
-              math.abs(total_score) < 3 ? "⚠️ MIXED ALIGNMENT: Score " + str.tostring(total_score,"#.#") + "/15. Waiting." :
-              total_score >= 3  ? "✅ BULLISH CONDITIONS: Score " + str.tostring(total_score,"#.#") + "/15." :
-              "✅ BEARISH CONDITIONS: Score " + str.tostring(total_score,"#.#") + "/15.") + "\n" +
-             "Sovereign: " + sovereignStatus + " | Liq: " + liq_bias
+        event_title := "🕒 " + f_session_short() + " SESSION OPEN"
+        string open_ctx_so = ""
+        if atrHL == "Low"
+            open_ctx_so := "ATR LOW — compressed range. Higher noise, tighter stops at risk. Wait for expansion."
+        else if math.abs(total_score) < 3
+            open_ctx_so := "Score " + str.tostring(total_score,"#.#") + "/15 — mixed alignment. No dominant bias yet."
+        else if total_score >= 3
+            open_ctx_so := "Score " + str.tostring(total_score,"#.#") + "/15 — bullish lean. Watch M5 trail for long entries."
+        else
+            open_ctx_so := "Score " + str.tostring(total_score,"#.#") + "/15 — bearish lean. Watch M5 trail for short entries."
+        string _poc_lv    = vpEnabled and not na(vp_currentPOC) ? "POC " + _p(vp_currentPOC) + " · VAH " + _p(array.get(vp_vaLevels,1)) + " · VAL " + _p(array.get(vp_vaLevels,0)) : "VP not computed yet."
+        string agenda_so  = ""
+        if total_score < -2 and sovereign_state == -1
+            agenda_so := "Bearish setup favoured. Sell-liq " + _p(pl_btm) + " as first magnet. Watch M5 trail ↓."
+        else if total_score > 2 and sovereign_state == 1
+            agenda_so := "Bullish setup favoured. Buy-liq " + _p(ph_top) + " as first magnet. Watch M5 trail ↑."
+        else
+            agenda_so := "Mixed conditions at open. Waiting for score and trail to align before positioning."
+        string _so_line2  = "ATR " + _bc_atr + " · D " + _bc_ll + " · Score " + str.tostring(total_score,"#.#") + "/15"
+        event_commentary :=
+             current_session + " · " + pdh_pdl_status + "\n" +
+             _so_line2 + "\n" +
+             _poc_lv + "\n" +
+             "Buy-liq " + _p(ph_top) + " · Sell-liq " + _p(pl_btm) + "\n" +
+             open_ctx_so + "\n" +
+             "→ " + agenda_so
 
-    // ── Build trade parameters block ──────────────────────────────────────
+    // ── TRADE PARAMETERS (entry signals only) ────────────────────────────
     string _tparams = ""
     if (buy_signal_confirmed or sell_signal_confirmed) and not na(locked_tp1)
-        string sz        = _size_display(locked_position_size)
-        string risk_info = show_risk_info ?
-             "Min-unit risk: ~$" + str.tostring(locked_actual_risk,"#.##") + "\n" : ""
         _tparams :=
-             _SEP2 + "\n" +
-             "🎯 TRADE PARAMETERS\n" +
-             _SEP2 + "\n" +
-             "Direction  : " + (buy_signal_confirmed ? "🟢 LONG"  : "🔴 SHORT") + "\n" +
-             "Entry      : " + _p(locked_entry) + "\n" +
-             "Stop Loss  : " + _p(locked_sl)    + "  (" + _pip_str(locked_risk_dist) + ")\n" +
-             "TP1 (1:1)  : " + _p(locked_tp1)   + "  (" + _pip_str(math.abs(locked_tp1-locked_entry)) + ")\n" +
-             "TP2 (1.5:1): " + _p(locked_tp2)   + "  (" + _pip_str(math.abs(locked_tp2-locked_entry)) + ")\n" +
-             "TP3 (2:1)  : " + _p(locked_tp3)   + "  (" + _pip_str(math.abs(locked_tp3-locked_entry)) + ")\n" +
-             "Risk $     : $" + str.tostring(risk_per_trade) + " → " + sz + "\n" +
-             risk_info +
-             "Trade ID   : " + atm_trade_id + "\n" +
-             "4-Layer    : " + agent_sync_phase + "\n"
+             _sep + "\n" +
+             "Entry  " + _p(locked_entry) +
+             "    SL " + _p(locked_sl) +
+             " (" + _pip_str(locked_risk_dist) + " · $" + str.tostring(risk_per_trade,"#.##") + ")\n" +
+             "TP1    " + _p(locked_tp1) +
+             " (+" + _pip_str(math.abs(locked_tp1-locked_entry)) + " · 1:1)\n" +
+             "TP2    " + _p(locked_tp2) +
+             " (+" + _pip_str(math.abs(locked_tp2-locked_entry)) + " · 1.5:1)\n" +
+             "TP3    " + _p(locked_tp3) +
+             " (+" + _pip_str(math.abs(locked_tp3-locked_entry)) + " · 2:1)\n" +
+             "Size   " + _size_display(locked_position_size) +
+             " · ID " + atm_trade_id + "\n"
 
-    // ── Build narrative block (NOW INCLUDES TREE FORMAT + PDH/PDL) ────────
-    string _narrative =
-             _SEP2 + "\n" +
-             "🧠 GLASS BOX AI NARRATIVE\n" +
-             _SEP2 + "\n" +
-             "Master Bias  : " + effective_bias + "\n" +
-             "Score        : " + str.tostring(total_score,"#.#") + "/15\n" +
-             "Daily Context: " + pdh_pdl_status + "\n" +
-             _SEP2 + "\n" +
-             "5-LAYER TREE\n" +
-             tree_narrative +
-             _SEP2 + "\n" +
-             "💡 AGENT ADVICE\n" +
-             ai_advice + "\n" +
-             "PF: " + (pip_pf==0.0?"—":str.tostring(math.min(pip_pf,99.9),"#.##")) +
-             "  WR: " + (pip_total_signals>0?str.tostring(pip_win_rate,"##.#")+"%":"—") + "\n"
-
-    // ══════════════════════════════════════════════════════════════════════
-    // PREMIUM / WAR ROOM (full Glass Box)
-    // ══════════════════════════════════════════════════════════════════════
+    // ── WAR ROOM MESSAGE ─────────────────────────────────────────────────
     string prem = ""
-    prem += _SEP + "\n"
-    prem += "🔥 ABSOLUTE DOLLAR — WAR ROOM\n"
-    prem += "Supreme Agent ADSA v7.0\n"
-    prem += _SEP + "\n"
-    prem += "📊 Asset   : " + _sym + "\n"
-    prem += "💰 Price   : " + _p(close) + "\n"
-    prem += "🌍 Session : " + current_session + "\n"
-    prem += "📅 Daily   : " + pdh_pdl_status + "\n"
-    if asset_context != ""
-        prem += "📌 Context : " + asset_context + "\n"
-    prem += _SEP2 + "\n"
-    prem += "🔔 EVENT: " + event_title + "\n"
-    prem += _SEP2 + "\n"
-    prem += "📝 AGENT COMMENTARY\n"
+    prem += event_title + " · " + _ticker_line + "\n"
+    prem += _sep + "\n"
     prem += event_commentary + "\n"
     if _tparams != ""
         prem += _tparams
-    prem += _narrative
+    bool show_full_ctx = buy_signal_confirmed or sell_signal_confirmed or vp_newSession
+    if show_full_ctx
+        string _prem_liq   = f_liq_ctx()
+        string _prem_mom   = f_score_momentum()
+        string _prem_synth = f_chain_synthesis(exec_state)
+        prem += _sep + "\n"
+        prem += _prem_liq + "\n"
+        if _prem_mom != ""
+            prem += _prem_mom + "\n"
+        prem += _prem_synth + "\n"
     if admin_commentary != ""
-        prem += _SEP2 + "\n💬 OPERATOR NOTE\n" + admin_commentary + "\n"
-    prem += _SEP2 + "\n"
-    prem += "🧊 LIQUIDITY\n"
-    prem += "Buy-side  : " + _p(ph_top)  + "\n"
-    prem += "Sell-side : " + _p(pl_btm)  + "\n"
-    prem += "Context   : " + liq_bias    + "\n"
-    prem += _SEP + "\n"
-    prem += "⚠️ Not financial advice. © 2026 Absolute Dollar"
-
-    // ══════════════════════════════════════════════════════════════════════
-    // PUBLIC / FREE CHANNEL (sanitized)
-    // ══════════════════════════════════════════════════════════════════════
-    string pub = ""
-    pub += _SEP + "\n"
-    pub += "🤖 ABSOLUTE DOLLAR — ATM AGENT\n"
-    pub += "Supreme Agent ADSA v7.0\n"
-    pub += _SEP + "\n"
-    pub += "📊 Asset   : " + _sym + "\n"
-    pub += "🌍 Session : " + current_session + "\n"
-    pub += "📅 Daily   : " + pdh_pdl_status + "\n"
+        prem += "Note: " + admin_commentary + "\n"
     if asset_context != ""
-        pub += "📌 Context : " + asset_context + "\n"
-    pub += _SEP2 + "\n"
-    pub += "🔔 EVENT: " + event_title + "\n"
-    pub += _SEP2 + "\n"
+        prem += "📌 " + asset_context + "\n"
 
+    // ── PUBLIC CHANNEL MESSAGE ────────────────────────────────────────────
+    string pub = ""
     if tg_public_sanitize
+        pub += event_title + " · " + syminfo.ticker + " " + timeframe.period + "\n"
         if silence_broadcast
-            pub += "📝 COMMENTARY\n🔇 Standing aside — operator silenced signals.\n"
+            pub += "Operator silence — standing aside.\n"
         else if sl_alert_event
-            pub += "📝 COMMENTARY\n💀 Stop absorbed. Glass Box logging. Reassessing.\n"
+            pub += "Loss absorbed · Glass Box autopsy logged.\n"
         else if tp3_alert_event
-            pub += "📝 COMMENTARY\n🚀 TP3 hit — full 2:1 run complete.\n"
+            pub += "2:1 full run complete.\n"
         else if tp2_alert_event
-            pub += "📝 COMMENTARY\n🎯🎯 TP2 hit — move stop to breakeven.\n"
+            pub += "1.5:1 secured · SL to breakeven.\n"
         else if tp1_alert_event
-            pub += "📝 COMMENTARY\n🎯 TP1 hit — partial secured.\n"
-        else if buy_signal_confirmed
-            pub += "📝 COMMENTARY\n" + (master_sync_buy?"🔥 Master Sync Long — 4 layers aligned.\n":sovereign_counter_buy?"⚠️ Counter-trend long — TP1 target only.\n":"🟢 Long signal confirmed.\n")
-        else if sell_signal_confirmed
-            pub += "📝 COMMENTARY\n" + (master_sync_sell?"🥶 Master Sync Short — 4 layers aligned.\n":sovereign_counter_sell?"⚠️ Counter-trend short — TP1 target only.\n":"🔴 Short signal confirmed.\n")
-        else if alert_liq_buy_sweep
-            pub += "📝 COMMENTARY\n⚠️ Buy-side liquidity swept — monitoring for setup.\n"
-        else if alert_liq_sell_sweep
-            pub += "📝 COMMENTARY\n⚠️ Sell-side liquidity swept — monitoring for setup.\n"
-        else if currentAlerts.swingBullishBOS or currentAlerts.swingBullishCHoCH
-            pub += "📝 COMMENTARY\n📈 Bullish structure shift confirmed.\n"
-        else if currentAlerts.swingBearishBOS or currentAlerts.swingBearishCHoCH
-            pub += "📝 COMMENTARY\n📉 Bearish structure shift confirmed.\n"
+            pub += "1:1 partial secured · trade ongoing.\n"
+        else if buy_signal_confirmed or sell_signal_confirmed
+            string dir_str_pub = buy_signal_confirmed ? "Long" : "Short"
+            int _pub_lc_cnt    = f_layers_count(buy_signal_confirmed ? 1 : -1)
+            string tag_pub     = master_sync_buy or master_sync_sell ? "4/4 TF aligned" : sovereign_counter_buy or sovereign_counter_sell ? "counter-trend · D opposing" : str.tostring(_pub_lc_cnt,"#") + "/4 TF aligned"
+            pub += dir_str_pub + " · Score " + str.tostring(total_score,"#.#") + "/15 · " + tag_pub + "\n"
+        else if alert_liq_buy_sweep or alert_liq_sell_sweep
+            pub += (alert_liq_buy_sweep ? "Buy-side" : "Sell-side") + " liq swept. Monitoring for exec trail signal.\n"
+        else if currentAlerts.swingBullishBOS or currentAlerts.swingBullishCHoCH or
+                currentAlerts.swingBearishBOS or currentAlerts.swingBearishCHoCH
+            pub += "Structure shift. Context updated — waiting for exec trail.\n"
         else if vp_newSession
-            pub += "📝 COMMENTARY\n🕒 " + current_session + " — scanning.\n"
-        pub += _SEP2 + "\n"
-        pub += "🧠 NARRATIVE\n"
-        pub += "Bias  : " + effective_bias    + "\n"
-        pub += "Score : " + str.tostring(total_score,"#.#") + "/15\n"
-        pub += "Sync  : " + agent_sync_phase  + "\n"
-        pub += "Daily : " + pdh_pdl_status    + "\n"
-        if buy_signal_confirmed or sell_signal_confirmed
-            pub += "Dir   : " + (buy_signal_confirmed?"🟢 LONG":"🔴 SHORT") + "\n"
-        pub += _SEP2 + "\n"
-        pub += "🔗 Full Glass Box report in War Room.\n"
+            pub += current_session + " · Score " + str.tostring(total_score,"#.#") + "/15 · " + pdh_pdl_status + "\n"
+        pub += pdh_pdl_status + "\n"
+        pub += "→ Full Glass Box in War Room."
     else
-        pub += prem
-
-    pub += _SEP2 + "\n⚠️ Not financial advice. © 2026 Absolute Dollar"
+        pub += _sep + "\n🤖 ABSOLUTE DOLLAR — ATM AGENT\n" + _sep + "\n"
+        pub += "📊 " + _sym + " · " + _ts + "\n"
+        pub += "🔔 " + event_title + "\n" + _sep + "\n"
+        pub += event_commentary + "\n"
+        if _tparams != ""
+            pub += _tparams
+        pub += "Score: " + str.tostring(total_score,"#.#") + "/15 · " + effective_bias + "\n"
+        string _pub_liq = f_liq_ctx()
+        pub += pdh_pdl_status + " · " + _pub_liq + "\n"
 
     // ── DISPATCH ──────────────────────────────────────────────────────────
     if tg_1_active
@@ -2558,7 +2959,6 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
         alert(_tg_json(tg_chat_id_2, pub), alert.freq_once_per_bar_close)
     if not tg_1_active and not tg_2_active
         alert(prem, alert.freq_once_per_bar_close)
-
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 27 — BITGET WEBHOOK OUTPUT
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2623,17 +3023,7 @@ if _daily_trigger
     float _avgS = _n > 0 ? _ss / _n : 0.0
     float _avgP = _wp > 0 ? _ps / _wp : 0.0
 
-    string _assess = dpt_total_sigs == 0 ?
-         "🔇 ZERO SIGNAL SESSION. Environment below threshold or silence active. Capital preserved." :
-         _wr >= 70 and _avgS >= 7 ?
-         "🔥 HIGH QUALITY SESSION. Strong 5-layer alignment scores + strong outcomes. Parameters calibrated." :
-         _wr >= 50 and _cls >= 2 ?
-         "📊 AVERAGE SESSION. Acceptable. Review counter-trend trades for drag." :
-         _sl > _t1 + _t2 + _t3 ?
-         "⚠️ DIFFICULT SESSION. SL hits exceeded TP captures. Review: score threshold, session, ATR state." :
-         _cc > 0 and float(_cc) / float(_n) > 0.4 ?
-         "⚠️ HIGH COUNTER-TREND RATIO (" + str.tostring(math.round(float(_cc)/float(_n)*100)) + "%). Apply TP1-only rule strictly." :
-         "📊 STANDARD SESSION. Accumulating data."
+    string _assess = f_daily_assessment()
 
     string _ml = "[ATM_DATA_ADSA]\ndate=" + str.tostring(year)+"."+_pad(month)+"."+_pad(dayofmonth) +
          "\nasset="+syminfo.ticker+"\ntf="+timeframe.period +
