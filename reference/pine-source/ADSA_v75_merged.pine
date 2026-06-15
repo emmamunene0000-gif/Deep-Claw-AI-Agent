@@ -1384,6 +1384,8 @@ bool rejection_alert    = (buy_rejected or sell_rejected) and barstate.isconfirm
 
 if sl_alert_event or holder_exit_event
     is_trade_running := false
+    trade_active     := false
+    trade_direction  := 0
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 17 — SMC VARIABLES & DECLARATIONS
@@ -3279,10 +3281,12 @@ bool short_exit_confirmed  = trade_active and trade_direction == -1 and (sl_aler
 if long_entry_confirmed
     strategy.close("Short", comment="Short REVERSAL") // Suppressed alert: EA handles via exent=1
     strategy.entry("Long", strategy.long, comment="Long Entry", alert_message=f_format_alert(long_entry_message, locked_position_size, locked_sl, locked_tp1, locked_tp2, locked_tp3, locked_actual_risk))
+    strategy.exit("Long SL", "Long", stop=locked_sl) // Backtester: exact intrabar SL simulation
 
 if short_entry_confirmed
     strategy.close("Long", comment="Long REVERSAL") // Suppressed alert: EA handles via exent=1
     strategy.entry("Short", strategy.short, comment="Short Entry", alert_message=f_format_alert(short_entry_message, locked_position_size, locked_sl, locked_tp1, locked_tp2, locked_tp3, locked_actual_risk))
+    strategy.exit("Short SL", "Short", stop=locked_sl) // Backtester: exact intrabar SL simulation
 
 if long_tp1_confirmed
     strategy.close("Long", qty_percent=33.3, comment="Long TP1", alert_message=f_format_alert(long_tp1_message, locked_position_size, locked_sl, locked_tp1, locked_tp2, locked_tp3, locked_actual_risk))
