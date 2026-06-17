@@ -407,8 +407,9 @@ liq_trail_enabled   = input.bool(true,  "✅ Enable MTF Liquidity Trail",       
      tooltip="Pulls pivot highs/lows from a higher TF for Holder Mode trailing stop and ATM signal gating.")
 liq_trail_tf        = input.timeframe("60", "📡 Trail Timeframe",              group=grpLiqTrail,
      tooltip="Higher TF from which pivot extremes are fetched. H1/H4/Daily recommended. Must be ≥ current chart TF.")
-liq_trail_pivot_len = input.int(14,     "📏 Pivot Lookback Length",            group=grpLiqTrail, minval=3,
-     tooltip="Number of bars each side used to confirm a swing high/low on the selected higher TF.")
+liq_trail_pivot_len = input.int(50,     "📏 Pivot Lookback Length",            group=grpLiqTrail,
+     options=[14, 20, 50, 100, 200],
+     tooltip="Bars each side to confirm a swing high/low on the selected higher TF. 50 = Claw Liquidity Suite fast pivots. 200 = macro/slow pivots (matches Smart Signals 200-bar setting).")
 requireLiqGate      = input.bool(true,  "🔒 Gate ATM Signals to Liq Trail",    group=grpLiqTrail,
      tooltip="ON = longs only fire when close > MTF pivot low (above demand). Shorts only when close < MTF pivot high (below supply). Blocks entries on the wrong structural side.")
 
@@ -1981,6 +1982,35 @@ tree_narrative =
      " └── M5 "             + (m5_score>=2.5?"🟢":m5_score<=-2.5?"🔴":m5_score>0?"🟡":m5_score<0?"🟠":"⚪") + "\n" +
      "      Regime :" + m5_r  + " V.WAP :" + m5_v  + " Fib Trend :" + m5_f  + " RSI:" + m5_ri  + "\n"
 
+// ── CHAIN LOGIC NARRATIVE (Telegram — sequential decision chain) ─────────────
+_chain_icon(float sc) =>
+    sc >= 2 ? "🟢" : sc <= -2 ? "🔴" : sc > 0 ? "🟡" : sc < 0 ? "🟠" : "⚪"
+
+_score_str(float sc) =>
+    sc > 0 ? "+" + str.tostring(int(sc)) : str.tostring(int(sc))
+
+_gate_label(float sc) =>
+    math.abs(sc) >= 2 ? "PASS" : math.abs(sc) == 1 ? "LEAN" : "HOLD"
+
+string _fib_chain  = requireFibTrend ?
+     (_trend_fib_gate== 1 ? "Bull ✅" : _trend_fib_gate==-1 ? "Bear ✅" : "Neut ⚠️") : "OFF"
+string _liq_chain  = _liqGateActive  ?
+     "L:" + (liqGateBull ? "✅" : "⛔") + " S:" + (liqGateBear ? "✅" : "⛔") : "OFF"
+string _chain_vtag = total_score >= 4 ? "🟢 LONG" : total_score <= -4 ? "🔴 SHORT" :
+     total_score > 0 ? "🟡 LEAN LONG" : total_score < 0 ? "🟠 LEAN SHORT" : "⚪ NEUTRAL"
+string _chain_exec = math.abs(total_score) >= 6 ? "EXECUTE" :
+     math.abs(total_score) >= 3 ? "WAIT CONF" : "STAND ASIDE"
+
+chain_narrative =
+     "🔗 DECISION CHAIN\n" +
+     "① Sovereign D   " + _chain_icon(sov_score)  + " " + sov_r  + " [" + _score_str(sov_score)  + "] → " + _gate_label(sov_score)  + "\n" +
+     "② Commander H4  " + _chain_icon(h4_score)   + " " + h4_r   + " [" + _score_str(h4_score)   + "] → " + _gate_label(h4_score)   + "\n" +
+     "③ Navigator H1  " + _chain_icon(h1_score)   + " " + h1_r   + " [" + _score_str(h1_score)   + "] → " + _gate_label(h1_score)   + "\n" +
+     "④ Filter    M15 " + _chain_icon(m15_score)  + " " + m15_r  + " [" + _score_str(m15_score)  + "] → " + _gate_label(m15_score)  + "\n" +
+     "⑤ Executor  M5  " + _chain_icon(m5_score)   + " " + m5_r   + " [" + _score_str(m5_score)   + "] → " + _gate_label(m5_score)   + "\n" +
+     "🔒 Fib: " + _fib_chain + "  Liq: " + _liq_chain + "\n" +
+     "★ " + _chain_vtag + " · " + str.tostring(total_score,"#.#") + "/15 · " + _chain_exec + "\n"
+
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 21 — PIP TRACKER (DAILY RESET, ACTUAL vs EXPECTED)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2533,7 +2563,7 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
              "Trade ID   : " + atm_trade_id + "\n" +
              "4-Layer    : " + agent_sync_phase + "\n"
 
-    // ── Build narrative block (NOW INCLUDES TREE FORMAT + PDH/PDL) ────────
+    // ── Build narrative block (CHAIN LOGIC format for Telegram readability) ─
     string _narrative =
              _SEP2 + "\n" +
              "🧠 GLASS BOX AI NARRATIVE\n" +
@@ -2542,8 +2572,7 @@ if useAgentAlerts and barstate.isconfirmed and (trigger_signal or silence_broadc
              "Score        : " + str.tostring(total_score,"#.#") + "/15\n" +
              "Daily Context: " + pdh_pdl_status + "\n" +
              _SEP2 + "\n" +
-             "5-LAYER TREE\n" +
-             tree_narrative +
+             chain_narrative +
              _SEP2 + "\n" +
              "💡 AGENT ADVICE\n" +
              ai_advice + "\n" +
