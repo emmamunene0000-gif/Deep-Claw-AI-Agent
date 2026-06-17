@@ -190,6 +190,20 @@ enableRegimeFilter = input.bool(true,  "🔒 Enable Regime Filter",       group=
 requireVWAP        = input.bool(false,  "📈 Require VWAP Confirmation",  group=grpATM)
 useAgentAlerts     = input.bool(true,  "📢 Activate Glass Box Reports", group=grpATM,
      tooltip="Structured reasoning report per event. Set Message = {{alert_message}} in TradingView Alert.")
+enableScoreGate  = input.bool(true,  "📊 Gate Signals on 5-Layer Score",  group=grpATM,
+     tooltip="Uses previous bar's total_score. Wires the 5-layer composite into actual trade decisions — prevents entries when MTF alignment disagrees.")
+min_score_long   = input.int(4,   "  └ Min Score Long",  group=grpATM, minval=0,   maxval=15, inline="scoreL",
+     tooltip="Minimum total_score required for a long entry. 4=recommended. 6=high-conviction only.")
+min_score_short  = input.int(-4,  "  └ Min Score Short", group=grpATM, minval=-15, maxval=0,  inline="scoreL",
+     tooltip="Maximum total_score allowed for a short entry. -4=recommended. -6=high-conviction only.")
+min_sync_layers  = input.int(2,   "🔗 Min 4-Layer Sync", group=grpATM, minval=0, maxval=4,
+     tooltip="Minimum fractal layers (Sovereign/Anchor/Filter/Exec) that must agree with entry direction. 0=off, 2=recommended, 4=master sync only.")
+requireVolConf   = input.bool(false, "📊 Volume Confirm", group=grpATM, inline="vmgate",
+     tooltip="Requires above-average volume on the ATM crossover bar. Filters low-conviction crossovers.")
+requireMacdConf  = input.bool(false, "📈 MACD Confirm",   group=grpATM, inline="vmgate",
+     tooltip="Requires MACD above signal (longs) or below (shorts) at entry bar. Free extra momentum layer.")
+requireSMCGate   = input.bool(false, "🏗️ SMC Structure Gate", group=grpATM,
+     tooltip="Gates entries to direction of the last confirmed swing BOS/CHoCH. Prevents counter-structure entries.")
 
 // ── RISK MANAGEMENT ───────────────────────────────────────────────────────────
 grpRisk        = "💰 Risk Management"
@@ -415,7 +429,7 @@ requireLiqGate      = input.bool(true,  "🔒 Gate ATM Signals to Liq Trail",   
 
 // ── FIBONACCI TREND GATE ──────────────────────────────────────────────────────
 grpFibGate          = "📊 Fibonacci Trend Gate"
-requireFibTrend     = input.bool(false, "🔒 Require Fibonacci Trend Alignment", group=grpFibGate,
+requireFibTrend     = input.bool(true,  "🔒 Require Fibonacci Trend Alignment", group=grpFibGate,
      tooltip="ON = buy signals blocked when Fib EMA trend = Bearish; sell signals blocked when Fib EMA trend = Bullish. Uses same double-EMA basis as the Fibonacci Bands (Section 12). No extra parameters needed.")
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -860,6 +874,13 @@ ncondition2 = negative  and not negative[1]
 plotshape(showRSIlabels and pcondition,  title="RSI+", style=shape.labelup,   color=color.new(color.green, 62), location=location.belowbar, size=size.tiny, text="BULL", textcolor=color.white)
 plotshape(showRSIlabels and ncondition2, title="RSI-", style=shape.labeldown, color=color.new(color.red,   66), location=location.abovebar, size=size.tiny, text="BEAR", textcolor=color.white)
 
+// ── Gate state vars: set by Sections 8 & 20 on each bar, read here next bar ──
+var float _prev_score = 0.0
+var int   _sync_bull  = 0
+var int   _sync_bear  = 0
+_vol_sma_gate          = ta.sma(volume, volMaLen)
+[_macdL_g, _sigL_g, _] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
+
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 7 — ATM BOT (ATR TRAILING STOP ENGINE)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -922,23 +943,39 @@ vwapBearish   = lastSwing == -1
 regimeBullish = requireVWAP ? (bullishRegime and vwapBullish) : bullishRegime
 regimeBearish = requireVWAP ? (bearishRegime and vwapBearish) : bearishRegime
 
-// ── [NEW v7.1] Fibonacci Trend gate ──────────────────────────────────────────
+// ── [v7.1] Fibonacci Trend gate ───────────────────────────────────────────────
 fibGateBull = requireFibTrend ? (_trend_fib_gate ==  1) : true
 fibGateBear = requireFibTrend ? (_trend_fib_gate == -1) : true
 
-// ── [NEW v7.1] MTF Liquidity gate ─────────────────────────────────────────────
-// Long: close must be above the last confirmed MTF pivot low (above demand).
-// Short: close must be below the last confirmed MTF pivot high (below supply).
+// ── [v7.1] MTF Liquidity gate ──────────────────────────────────────────────────
 _liqGateActive = requireLiqGate and liq_trail_enabled
 liqGateBull = _liqGateActive ? (not na(mtf_liq_pivot_low)  ? close > mtf_liq_pivot_low  : true) : true
 liqGateBear = _liqGateActive ? (not na(mtf_liq_pivot_high) ? close < mtf_liq_pivot_high : true) : true
 
+// ── [v7.2] 5-Layer Score gate (prev bar total_score — 1-bar lag, no repaint) ──
+scoreGateBull = enableScoreGate ? (_prev_score >= float(min_score_long))  : true
+scoreGateBear = enableScoreGate ? (_prev_score <= float(min_score_short)) : true
+
+// ── [v7.2] 4-Layer Fractal Sync gate ─────────────────────────────────────────
+syncGateBull  = min_sync_layers > 0 ? (_sync_bull >= min_sync_layers) : true
+syncGateBear  = min_sync_layers > 0 ? (_sync_bear >= min_sync_layers) : true
+
+// ── [v7.2] Volume + MACD confirmation (no extra security calls) ──────────────
+volGateBull   = requireVolConf  ? (volume > _vol_sma_gate) : true
+volGateBear   = requireVolConf  ? (volume > _vol_sma_gate) : true
+macdGateBull  = requireMacdConf ? (_macdL_g > _sigL_g)    : true
+macdGateBear  = requireMacdConf ? (_macdL_g < _sigL_g)    : true
+
+// ── [v7.2] SMC Structure gate (swingTrend.bias persists from prev bar close) ──
+smcGateBull   = requireSMCGate  ? (swingTrend.bias == BULLISH) : true
+smcGateBear   = requireSMCGate  ? (swingTrend.bias == BEARISH) : true
+
 buy_signal_filtered  = enableRegimeFilter ?
-     (buy_signal  and regimeBullish and fibGateBull and liqGateBull) :
-     (buy_signal  and fibGateBull and liqGateBull)
+     (buy_signal  and regimeBullish and fibGateBull and liqGateBull and scoreGateBull and syncGateBull and volGateBull and macdGateBull and smcGateBull) :
+     (buy_signal  and fibGateBull   and liqGateBull and scoreGateBull and syncGateBull and volGateBull and macdGateBull and smcGateBull)
 sell_signal_filtered = enableRegimeFilter ?
-     (sell_signal and regimeBearish and fibGateBear and liqGateBear) :
-     (sell_signal and fibGateBear and liqGateBear)
+     (sell_signal and regimeBearish and fibGateBear and liqGateBear and scoreGateBear and syncGateBear and volGateBear and macdGateBear and smcGateBear) :
+     (sell_signal and fibGateBear   and liqGateBear and scoreGateBear and syncGateBear and volGateBear and macdGateBear and smcGateBear)
 
 var int posState = 0
 var bool is_trade_running = false
@@ -955,11 +992,11 @@ sell_signal_confirmed = sellEnabled and sell_signal_filtered and posState == -1 
 
 buy_sig_vis   = buyEnabled  and buy_signal_filtered
 sell_sig_vis  = sellEnabled and sell_signal_filtered
-// rejected = any gate (regime, fib, or liq) blocked a raw ATM signal
-buy_rejected  = buy_signal_raw  and not (fibGateBull and liqGateBull) or
-     (enableRegimeFilter and buy_signal_raw  and not regimeBullish)
-sell_rejected = sell_signal_raw and not (fibGateBear and liqGateBear) or
-     (enableRegimeFilter and sell_signal_raw and not regimeBearish)
+// rejected = any gate blocked a raw ATM signal
+bool _allBullGates = fibGateBull and liqGateBull and scoreGateBull and syncGateBull and volGateBull and macdGateBull and smcGateBull
+bool _allBearGates = fibGateBear and liqGateBear and scoreGateBear and syncGateBear and volGateBear and macdGateBear and smcGateBear
+buy_rejected  = buy_signal_raw  and not _allBullGates or (enableRegimeFilter and buy_signal_raw  and not regimeBullish)
+sell_rejected = sell_signal_raw and not _allBearGates or (enableRegimeFilter and sell_signal_raw and not regimeBearish)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 8 — FRACTAL 4-LAYER STATE MACHINE
@@ -968,6 +1005,10 @@ sovereign_state = request.security(syminfo.tickerid, sovereign_tf, posState, bar
 anchor_state    = request.security(syminfo.tickerid, anchor_tf,    posState, barmerge.gaps_off, barmerge.lookahead_off)
 filter_state    = request.security(syminfo.tickerid, filter_tf,    posState, barmerge.gaps_off, barmerge.lookahead_off)
 exec_state      = posState
+
+// ── Sync score: count aligned layers, persisted for next bar's syncGate ───────
+_sync_bull := (sovereign_state== 1?1:0) + (anchor_state== 1?1:0) + (filter_state== 1?1:0) + (exec_state== 1?1:0)
+_sync_bear := (sovereign_state==-1?1:0) + (anchor_state==-1?1:0) + (filter_state==-1?1:0) + (exec_state==-1?1:0)
 
 var string agent_sync_phase = "SOVEREIGN NEUTRAL"
 bool master_sync_buy  = false
@@ -1918,6 +1959,7 @@ h1_score   = n_score(h1_r)  + n_score(h1_v)  + n_score(h1_f)
 m15_score  = n_score(m15_r) + n_score(m15_v) + n_score(m15_f)
 m5_score   = n_score(m5_r)  + n_score(m5_v)  + n_score(m5_f)
 total_score = sov_score + h4_score + h1_score + m15_score + m5_score
+_prev_score := total_score  // persisted for next bar's scoreGate in Section 7
 
 liq_bias = close > ph_top and not na(ph_top) ? "💧 BREAKING SWING HIGH" :
      close < pl_btm and not na(pl_btm) ? "💧 BREAKING SWING LOW" :
@@ -1951,13 +1993,22 @@ string effective_bias = admin_manual_bias == "FORCE BULL" ? "📡 ADMIN: FORCED 
      admin_manual_bias == "SILENCE"    ? "🔇 ADMIN: SILENCE — STANDING ASIDE" :
      master_bias
 
-string ai_advice = total_score >= 10 ? "Aggressive entry — 4-layer sovereign aligned." :
-     total_score >= 6  ? "Confident entry — bias confirmed. Verify chart." :
-     total_score >= 3  ? "Cautious entry — moderate alignment. Wait score > 6." :
-     total_score <= -10 ? "Aggressive short — 4-layer sovereign aligned." :
-     total_score <= -6  ? "Confident short — bearish bias confirmed." :
-     total_score <= -3  ? "Cautious short — wait score < -6." :
-     "Neutral. Stand aside. No edge present."
+string ai_advice =
+     total_score >= 10 and atrHL=="High" ? "🔥 MAX CONVICTION LONG — sovereign aligned + high ATR. Full size. Run to TP3." :
+     total_score >= 10                   ? "✅ SOVEREIGN BULL — all layers aligned. Scale size. Watch ATR for expansion." :
+     total_score >= 6  and atrHL=="High" ? "✅ HIGH CONF LONG — above gate + high vol. Standard size, TP3 target." :
+     total_score >= 6                    ? "✅ STRONG BULL — score above gate. Standard size. Full TP sequence." :
+     total_score >= 4                    ? "⚠️ AT GATE THRESHOLD — half size only. Target TP1/TP2, skip holder mode." :
+     total_score >= 2                    ? "⏳ BELOW SCORE GATE (" + str.tostring(int(total_score)) + "/15) — wait for 4+." :
+     total_score > 0                     ? "⏳ LEAN BULL — insufficient edge. Stand aside." :
+     total_score <= -10 and atrHL=="High"? "🔥 MAX CONVICTION SHORT — sovereign bear + high ATR. Full size short." :
+     total_score <= -10                  ? "✅ SOVEREIGN BEAR — all layers aligned short. Scale size." :
+     total_score <= -6  and atrHL=="High"? "✅ HIGH CONF SHORT — above gate + high vol. Standard short, TP3." :
+     total_score <= -6                   ? "✅ STRONG BEAR — score above gate. Standard short. Full TP sequence." :
+     total_score <= -4                   ? "⚠️ AT GATE THRESHOLD — half short size. TP1/TP2 only." :
+     total_score <= -2                   ? "⏳ BELOW SHORT GATE (" + str.tostring(int(total_score)) + "/15) — wait for -4." :
+     total_score < 0                     ? "⏳ LEAN BEAR — insufficient edge. Stand aside." :
+                                           "⚪ NEUTRAL — score 0/15. No directional edge. Stand aside."
 
 // ── [NEW v7.0] TREE NARRATIVE BUILDER ────────────────────────────────────────
 // Builds a ├── / │ / └── formatted tree row for a single timeframe layer.
@@ -2009,7 +2060,9 @@ chain_narrative =
      "④ Filter    M15 " + _chain_icon(m15_score)  + " " + m15_r  + " [" + _score_str(m15_score)  + "] → " + _gate_label(m15_score)  + "\n" +
      "⑤ Executor  M5  " + _chain_icon(m5_score)   + " " + m5_r   + " [" + _score_str(m5_score)   + "] → " + _gate_label(m5_score)   + "\n" +
      "🔒 Fib: " + _fib_chain + "  Liq: " + _liq_chain + "\n" +
-     "★ " + _chain_vtag + " · " + str.tostring(total_score,"#.#") + "/15 · " + _chain_exec + "\n"
+     "📊 Score: " + str.tostring(total_score,"#.#") + "/15  Gate≥" + str.tostring(min_score_long) + ": " + (enableScoreGate ? (total_score >= float(min_score_long) ? "✅" : "⛔") : "OFF") + "\n" +
+     "🔗 Sync: " + str.tostring(_sync_bull) + "↑/" + str.tostring(_sync_bear) + "↓ of 4  Gate≥" + str.tostring(min_sync_layers) + ": " + (min_sync_layers > 0 ? (_sync_bull >= min_sync_layers or _sync_bear >= min_sync_layers ? "✅" : "⛔") : "OFF") + "\n" +
+     "★ " + _chain_vtag + " · " + _chain_exec + "\n"
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SECTION 21 — PIP TRACKER (DAILY RESET, ACTUAL vs EXPECTED)
@@ -2264,7 +2317,9 @@ if dashOn and not na(dashTable) and barstate.islast
          " VWAP " + (lastSwing==1?"📈":lastSwing==-1?"📉":"⚪") + "  Fib " + (trend_fib==1?"📈":trend_fib==-1?"📉":"⚪") + D +
          " RSI " + (rsi>pmom?"📈":rsi<nmom?"📉":"⚪") + " (" + str.tostring(rsi,"##") + ")  MACD: " + macdB + D +
          " 🔒 FibGate: " + (requireFibTrend ? (_trend_fib_gate==1?"✅ Bull":_trend_fib_gate==-1?"✅ Bear":"⛔ Neut") : "OFF") +
-         "  LiqGate: " + (_liqGateActive ? (liqGateBull and posState>=0 or liqGateBear and posState<=0 ? "✅ OK" : "⛔ BLOCKED") : "OFF") + D +
+         "  LiqGate: " + (_liqGateActive ? (liqGateBull and posState>=0 or liqGateBear and posState<=0 ? "✅ OK" : "⛔ BLK") : "OFF") + D +
+         " 📊 ScoreGate: " + (enableScoreGate ? "≥" + str.tostring(min_score_long) + " | " + str.tostring(int(total_score)) + "/15 " + (scoreGateBull ? "✅" : "⛔") : "OFF") +
+         "  Sync: " + str.tostring(_sync_bull) + "↑/" + str.tostring(_sync_bear) + "↓ " + (min_sync_layers > 0 ? (syncGateBull or syncGateBear ? "✅" : "⛔") : "—") + D +
          " 💧 MTF Pivots [" + liq_trail_tf + "]: H=" + _p(mtf_liq_pivot_high) + "  L=" + _p(mtf_liq_pivot_low) + D +
          L +
          " 📈 MTF EMA (9/21)" + D +
