@@ -204,6 +204,8 @@ requireMacdConf  = input.bool(false, "📈 MACD Confirm",   group=grpATM, inline
      tooltip="Requires MACD above signal (longs) or below (shorts) at entry bar. Free extra momentum layer.")
 requireSMCGate   = input.bool(false, "🏗️ SMC Structure Gate", group=grpATM,
      tooltip="Gates entries to direction of the last confirmed swing BOS/CHoCH. Prevents counter-structure entries.")
+enableCandleConf = input.bool(false, "🕯️ Confirmation Candle", group=grpATM,
+     tooltip="Requires a 2nd bar close above (longs) / below (shorts) the ATM trail before entry fires. Eliminates single-bar false trail crosses that get hunted on reversal.")
 
 // ── RISK MANAGEMENT ───────────────────────────────────────────────────────────
 grpRisk        = "💰 Risk Management"
@@ -878,6 +880,7 @@ plotshape(showRSIlabels and ncondition2, title="RSI-", style=shape.labeldown, co
 var float _prev_score = 0.0
 var int   _sync_bull  = 0
 var int   _sync_bear  = 0
+var int   _smc_bias   = 0  // mirrors swingTrend.bias (Section 17+); updated after displayStructure()
 _vol_sma_gate          = ta.sma(volume, volMaLen)
 [_macdL_g, _sigL_g, _] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
 
@@ -928,12 +931,15 @@ else
 above_buy_cross  = ta.crossover(ema_buy,   trail_buy)
 below_sell_cross = ta.crossover(trail_sell, ema_sell)
 
-above_buy       = buyEnabled  and above_buy_cross
-buy_signal_raw  = buyEnabled  and (src_buy  > trail_buy)  and above_buy
-buy_signal      = buy_signal_raw and barstate.isconfirmed
+above_buy        = buyEnabled  and above_buy_cross
+_cross_buy_raw   = buyEnabled  and (src_buy  > trail_buy)  and above_buy
+below_sell       = sellEnabled and below_sell_cross
+_cross_sell_raw  = sellEnabled and (src_sell < trail_sell) and below_sell
 
-below_sell      = sellEnabled and below_sell_cross
-sell_signal_raw = sellEnabled and (src_sell < trail_sell) and below_sell
+// [v7.2] Confirmation candle: require 2nd bar close holding above/below trail
+buy_signal_raw  = enableCandleConf ? (_cross_buy_raw[1]  and barstate.isconfirmed and close > trail_buy)  : _cross_buy_raw
+sell_signal_raw = enableCandleConf ? (_cross_sell_raw[1] and barstate.isconfirmed and close < trail_sell) : _cross_sell_raw
+buy_signal      = buy_signal_raw and barstate.isconfirmed
 sell_signal     = sell_signal_raw and barstate.isconfirmed
 
 bullishRegime = positive
@@ -966,9 +972,9 @@ volGateBear   = requireVolConf  ? (volume > _vol_sma_gate) : true
 macdGateBull  = requireMacdConf ? (_macdL_g > _sigL_g)    : true
 macdGateBear  = requireMacdConf ? (_macdL_g < _sigL_g)    : true
 
-// ── [v7.2] SMC Structure gate (swingTrend.bias persists from prev bar close) ──
-smcGateBull   = requireSMCGate  ? (swingTrend.bias == BULLISH) : true
-smcGateBear   = requireSMCGate  ? (swingTrend.bias == BEARISH) : true
+// ── [v7.2] SMC Structure gate (_smc_bias mirrors swingTrend.bias, updated each bar after displayStructure) ──
+smcGateBull   = requireSMCGate  ? (_smc_bias == BULLISH) : true
+smcGateBear   = requireSMCGate  ? (_smc_bias == BEARISH) : true
 
 buy_signal_filtered  = enableRegimeFilter ?
      (buy_signal  and regimeBullish and fibGateBull and liqGateBull and scoreGateBull and syncGateBull and volGateBull and macdGateBull and smcGateBull) :
@@ -2887,6 +2893,7 @@ if showInternalsInput or showInternalOrderBlocksInput or showTrendInput
     displayStructure(true)
 if showStructureInput or showSwingOrderBlocksInput or showHighLowSwingsInput
     displayStructure()
+_smc_bias := swingTrend.bias  // persist for Section 7's SMC gate on next bar
 if showInternalOrderBlocksInput
     deleteOrderBlocks(true)
 if showSwingOrderBlocksInput
