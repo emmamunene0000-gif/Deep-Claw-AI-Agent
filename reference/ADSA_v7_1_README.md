@@ -1,4 +1,4 @@
-# ABSOLUTE DOLLAR SUPREME AGENT — ADSA v7.1
+# ABSOLUTE DOLLAR SUPREME AGENT — ADSA v7.2
 ### Augmented Intelligence Protocol | Pine Script v6
 **© 2026 Absolute Dollar Intelligence | Invite-Only | Not Financial Advice**
 
@@ -11,6 +11,7 @@
 4. [Installation](#4-installation)
 5. [Full Settings Guide](#5-full-settings-guide)
 6. [v7.1 New Features In Detail](#6-v71-new-features-in-detail)
+7a. [v7.2 New Features In Detail](#7a-v72-new-features-in-detail)
 7. [Alert & Telegram Setup](#7-alert--telegram-setup)
 8. [TradeSgnl / Bitget Automation](#8-tradesgnl--bitget-automation)
 9. [M1 & M5 Intraday Framework](#9-m1--m5-intraday-framework)
@@ -21,10 +22,10 @@
 
 ## 1. What This Is
 
-ADSA v7.1 is a **complete multi-timeframe trading system** built in Pine Script v6 for TradingView. It is not a simple indicator — it is an agent that:
+ADSA v7.2 is a **complete multi-timeframe trading system** built in Pine Script v6 for TradingView. It is not a simple indicator — it is an agent that:
 
 - **Reads the market** across 5 timeframes simultaneously using a composite scoring engine (+15 to −15)
-- **Gates signals** through a 4-layer fractal consensus, a regime filter, a Fibonacci trend filter, and a structural liquidity filter
+- **Gates signals** through up to 9 stacked layers: regime filter, Fibonacci trend, MTF liquidity position, 5-layer composite score, 4-layer fractal sync, volume confirmation, MACD confirmation, and SMC structure bias
 - **Sizes positions** automatically using a dollar-risk model routed through the correct asset-class math (forex lots, crypto coins, futures contracts)
 - **Manages trades** through a structured 3-TP progression with an optional runner in Holder Mode
 - **Broadcasts reasoning** to Telegram (War Room full Glass Box + Public sanitized) with transparent per-event commentary
@@ -38,8 +39,8 @@ Everything it does is visible. Every blocked signal has a reason. Every stop los
 
 | # | Subsystem | What It Does |
 |---|-----------|--------------|
-| 1 | **Fractal 4-Layer Consensus** | Sovereign/Anchor/Filter/Exec alignment check. Fully aligned = `🔥 MASTER SYNC` signal |
-| 2 | **5-TF Composite Scoring** | D/H4/H1/M15/M5 each scored on 3 factors (Regime, VWAP, Fib Trend). Range: +15 to −15 |
+| 1 | **Fractal 4-Layer Consensus + Sync Gate** | Sovereign/Anchor/Filter/Exec alignment. Fully aligned = `🔥 MASTER SYNC`. v7.2: configurable min-sync-layers gate *blocks* entries when fewer than N layers agree |
+| 2 | **5-TF Composite Scoring + Score Gate** | D/H4/H1/M15/M5 each scored on 3 factors (Regime, VWAP, Fib). Range: +15 to −15. v7.2: score now *wires into the signal chain* — below-threshold entries are blocked |
 | 3 | **Glass Box Alerts** | Rich per-event reasoning string dispatched to TradingView alerts |
 | 4 | **Trade Progression Engine** | TP1→TP2→TP3→Holder Mode with partial closes at each level |
 | 5 | **SL Autopsy Engine** | On stop hit: contextual narrative explaining WHY (liquidity trap, low ATR, sovereign veto, etc.) |
@@ -55,8 +56,9 @@ Everything it does is visible. Every blocked signal has a reason. Every stop los
 | 15 | **Daily Report Engine** | Full trade log + ML data block dispatched to Telegram at configurable UTC hour |
 | 16 | **Live Dollar P&L Tracker** | Per-bar unrealised P&L in quote currency, fully asset-routed |
 | 17 | **PDH/PDL Context Engine** | Previous Day High/Low with status: Above PDH / Below PDL / Inside Range |
-| 18 | **MTF Liquidity Trail** *(v7.1 NEW)* | Pivot-based holder trail from a higher TF + optional ATM signal gate |
-| 19 | **Fibonacci Trend Gate** *(v7.1 NEW)* | Double-EMA Fib trend gates ATM signals against counter-trend entries |
+| 18 | **MTF Liquidity Trail** *(v7.1)* | Pivot-based holder trail from a higher TF + optional ATM signal gate. Pivot length now a dropdown: 14/20/50/100/200 (default 50) |
+| 19 | **Fibonacci Trend Gate** *(v7.1)* | Double-EMA Fib trend gates ATM signals against counter-trend entries. Default changed to ON in v7.2 |
+| 20 | **SMC Structure Gate** *(v7.2 NEW)* | Optional gate using `swingTrend.bias` from the SMC engine — entries require confirmed BOS/CHoCH structural direction agreement |
 
 ---
 
@@ -73,11 +75,13 @@ Everything it does is visible. Every blocked signal has a reason. Every stop los
 
 1. Open TradingView → **Pine Editor** (bottom panel)
 2. Delete any existing code, paste the entire contents of `ADSA_v7_ChatPaste_MTFLiqFib.pine`
-3. Click **Save** → name it "Absolute Dollar Agent v7.1"
+3. Click **Save** → name it "Absolute Dollar Agent v7.2"
 4. Click **Add to chart**
 5. The strategy will load with default settings — configure using the **Settings** panel
 
 > **Important**: This is a `strategy()` script, not `indicator()`. It will show a Strategy Tester panel. This is intentional — the tester gives you a live backtest of signal quality on the current chart.
+
+> **v7.2 note**: On first load, the Score Gate (default ON, ≥4) and Sync Gate (default ON, ≥2) are active. If you see no signals in the Strategy Tester on a quiet asset/period, this is expected — the gates are working. Try lowering `Min Score Long` to `2` temporarily to see what signals the system would have taken without those gates.
 
 ---
 
@@ -110,6 +114,17 @@ Everything it does is visible. Every blocked signal has a reason. Every stop los
 | Require VWAP Confirmation | `OFF` | Also require Adaptive VWAP swing agreement |
 | Activate Glass Box Reports | `ON` | Enable rich per-event alert messages |
 
+### 📊 Signal Gate Chain *(v7.2 NEW)*
+| Input | Default | Notes |
+|-------|---------|-------|
+| Gate Signals on 5-Layer Score | `ON` | Wires the composite score into the signal chain. Uses the *previous bar's* total_score to avoid look-ahead |
+| Min Score Long | `4` | Minimum total_score (0–15) required to allow a long entry. Recommended: 4 minimum, 6 for full position |
+| Min Score Short | `-4` | Maximum total_score (0 to −15) required to allow a short entry |
+| Min 4-Layer Sync | `2` | How many of the 4 fractal layers must agree. `0` = gate disabled; `4` = only MASTER SYNC signals pass |
+| Volume Confirm | `OFF` | Require volume > SMA(vol,20) at signal bar. Helps filter low-conviction bar closes |
+| MACD Confirm | `OFF` | Require MACD line above/below signal line. Reduces signals in choppy markets |
+| SMC Structure Gate | `OFF` | Require `swingTrend.bias` to agree with signal direction. Blocks entries that contradict the last confirmed BOS/CHoCH |
+
 ### 💰 Risk Management
 | Input | Default | Notes |
 |-------|---------|-------|
@@ -124,13 +139,13 @@ Everything it does is visible. Every blocked signal has a reason. Every stop los
 |-------|---------|-------|
 | Enable MTF Liquidity Trail | `ON` | Master toggle for both the trail and gate |
 | Trail Timeframe | `60` (H1) | TF for pivot high/low. Must be ≥ chart TF |
-| Pivot Lookback Length | `14` | Bars each side to confirm a swing |
+| Pivot Lookback Length | `50` *(was 14)* | **Dropdown: 14 / 20 / 50 / 100 / 200.** 50 = Claw Liquidity Suite fast-pivot setting. 200 = macro slow pivots. Higher = fewer, more significant pivot levels |
 | Gate ATM Signals to Liq Trail | `ON` | Block entries on the wrong structural side |
 
 ### 📊 Fibonacci Trend Gate *(v7.1)*
 | Input | Default | Notes |
 |-------|---------|-------|
-| Require Fibonacci Trend Alignment | `OFF` | When ON, adds third gate layer. Reduces signals but increases quality |
+| Require Fibonacci Trend Alignment | `ON` *(was OFF)* | Double-EMA Fib trend gate. **Default changed to ON in v7.2** — gate is now active by default to reduce counter-trend noise. Disable on M1/M5 scalping charts where both-direction entries are needed |
 
 ---
 
@@ -161,13 +176,103 @@ This filters out the single most common failure mode: entering a long into a bea
 
 ### Fibonacci Trend Gate
 
-Off by default — it is a **stricter secondary gate** that enforces trend direction. The double-EMA basis (`EMA(EMA(close, 200), 200)`) is a slow, smooth trend engine that cuts through noise. Enable it when:
-- You are trading with-trend only and want to eliminate every counter-trend entry
-- You want maximum signal quality over signal frequency
-
-Leave it OFF when:
+Now ON by default in v7.2. The double-EMA basis (`EMA(EMA(close, 200), 200)`) is a slow, smooth trend engine that cuts through noise. Disable it when:
 - You are scalping M1/M5 and need signals in both directions within sessions
 - Your sovereign/fractal layers are already filtering aggressively
+
+Keep it ON (default) when:
+- You are swing trading or intraday trend-following
+- You want to reduce counter-trend entry noise
+
+---
+
+## 7a. v7.2 New Features In Detail
+
+### 5-Layer Score Gate (the most important v7.2 change)
+
+**The problem it solves**: In v7.1, the composite score (D/H4/H1/M15/M5, range +15 to −15) was displayed prominently in the dashboard, the Telegram chain, and the Glass Box commentary — but it had **zero effect on whether a signal fired**. The ATM bot could trigger a full long entry with a score of −8 (5 TFs screaming bearish). The score was a label, not a gate.
+
+**How v7.2 fixes it**: The score is now wired into the signal chain via a 1-bar persistence pattern:
+- After `total_score` is computed each bar, it is stored in `_prev_score` (a `var` variable)
+- On the next bar, `buy_signal_filtered` and `sell_signal_filtered` check `_prev_score` against your threshold before letting a signal through
+- The 1-bar lag is intentional — it ensures the gate reads a confirmed, closed-bar score and never repaints
+
+**Threshold guide**:
+| Score | Meaning | Recommended action |
+|-------|---------|-------------------|
+| ±10–15 | Sovereign alignment — all 5 TFs agree | Full position, TP3 target, Holder Mode runner |
+| ±6–9 | Strong bias — 4 of 5 TFs aligned | Standard position, TP3 target |
+| ±4–5 | At gate threshold (default) | Half position, TP1/TP2 only |
+| ±2–3 | Below gate — insufficient MTF edge | Stand aside; system blocks the signal |
+| 0–±1 | Neutral — no directional alignment | Stand aside |
+
+The default `min_score_long = 4` / `min_score_short = -4` is a conservative starting point. Raise to `6` for higher win-rate (fewer signals). Lower to `2` if you find the gates too restrictive on your specific asset.
+
+### 4-Layer Fractal Sync Gate
+
+**The problem it solves**: The `🔥 MASTER SYNC` label was informational only in v7.1. The 4-layer state machine (Sovereign/Anchor/Filter/Exec) tracked alignment and annotated commentary labels, but it did not block entries when layers disagreed.
+
+**How v7.2 fixes it**: Two counters — `_sync_bull` and `_sync_bear` — count how many of the 4 fractal layers currently read bullish or bearish. These are compared against `min_sync_layers` (default: 2) before each signal fires.
+
+With `min_sync_layers = 2`:
+- An ATM buy signal requires at least 2 of the 4 layers to be in a bullish state
+- This eliminates the most common "noise signal": ATM fires on M5 while Sovereign + Anchor are both bearish
+
+**Tier guide**:
+| min_sync_layers | Behavior | Best for |
+|-----------------|---------|---------|
+| `0` | Gate disabled — any signal passes | Maximum frequency; use with strict score gate instead |
+| `1` | At least one layer agrees | Permissive; good for assets with low layer correlation |
+| `2` *(default)* | Majority of lower layers agree | Balanced — blocks isolated M5 noise while allowing H1/D alignment plays |
+| `3` | Strong alignment required | High-quality swing signals; will miss intraday breakouts |
+| `4` | MASTER SYNC only | Lowest frequency; only the highest-conviction setups |
+
+### SMC Structure Gate
+
+**What it does**: Uses `swingTrend.bias` from the SMC engine (the same engine that draws BOS/CHoCH labels on the chart). This is the SMC view of structural direction:
+- `BULLISH (1)` = the SMC engine has confirmed a bullish BOS or established bullish HTF bias
+- `BEARISH (-1)` = bearish structural confirmation
+- `0` = undefined / no confirmed structure yet
+
+When enabled (`requireSMCGate = ON`), buy signals are blocked if `swingTrend.bias != BULLISH` and sell signals are blocked if `swingTrend.bias != BEARISH`.
+
+**Important**: This gate uses zero additional `request.security` calls (the script is already near the 40-call limit at ~33 calls). `swingTrend.bias` is a `var trend` type that persists between bars — the gate is reading the *previous bar's confirmed structural bias*, which is clean and non-repainting.
+
+**When to enable**: Turn ON when you want your ATM signals to be anchored to confirmed SMC structure, not just trend proxies. Most effective on M5/M15 when combined with the ScoreGate (prevents entries that have ATM momentum but no structural basis).
+
+### Volume and MACD Confirms
+
+Both are OFF by default — they are secondary filters for users who want tighter entry quality at the cost of signal frequency.
+
+- **Volume Confirm**: Requires volume > SMA(vol,20) at the signal bar. Blocks quiet-session signals that fire on low-conviction candles. Most useful in crypto where volume is a meaningful on-chain proxy.
+- **MACD Confirm**: Requires MACD line above signal line (longs) or below signal line (shorts). This is a momentum cross confirmation on top of the ATM trail cross. Useful for preventing entries immediately after a momentum exhaustion.
+
+### Selector Pivot Length for MTF Liquidity
+
+The MTF Liquidity Trail pivot lookback was previously hardcoded to 14 bars. This is now a dropdown:
+
+| Setting | Behavior | Match With |
+|---------|---------|-----------|
+| `14` | Short lookback — most recent swing pivots | Scalp entries, M1/M5 intraday |
+| `20` | Standard swing pivots | M5/M15 standard setup |
+| `50` *(default)* | Claw Liquidity Suite fast-pivot | Matches CLS default for consistent level confluence |
+| `100` | Macro swing structure | H1/H4 swing trading |
+| `200` | Macro slow pivots | Matches Smart Signals 200-bar setting; D/W structural levels |
+
+Setting this to 50 means the liquidity gate and trail levels will match the pivot levels drawn by the Claw Liquidity Suite, making the two systems consistent when used together.
+
+### ai_advice Score-Contextual Sizing Guidance
+
+The `ai_advice` string displayed in the Glass Box and Telegram is now **score-contextual** — it tells you not just direction but *what position size is appropriate* based on the current score:
+
+- `🔥 MAX CONVICTION LONG` (score ≥ 10 + high ATR): Full size, run to TP3, runner in Holder Mode
+- `✅ SOVEREIGN BULL` (score ≥ 10): Scale size, watch ATR for expansion
+- `✅ HIGH CONF LONG` (score ≥ 6 + high ATR): Standard size, TP3 target
+- `✅ STRONG BULL` (score ≥ 6): Standard size, full TP sequence
+- `⚠️ AT GATE THRESHOLD` (score ≥ 4): Half size, TP1/TP2 only
+- `⏳ BELOW SCORE GATE` (score ≥ 2): Shows current score — wait for gate threshold
+- `⏳ LEAN BULL` (score > 0): Insufficient edge — stand aside
+- *(symmetric for short side)*
 
 ---
 
@@ -195,7 +300,9 @@ Leave it OFF when:
 **War Room (Premium)** receives every event with:
 - Full Glass Box commentary (why the signal fired)
 - All trade parameters (Entry, SL, TP1/2/3, size, risk)
-- 5-layer AI narrative tree (D/H4/H1/M15/M5 each with Regime/VWAP/Fib/RSI)
+- **Decision chain** (v7.2): each MTF layer shown as a single-line gate status — `D: ▲ 3/3 ✅ | H4: ▲ 2/3 ✅ | ...` — replaces the old ASCII tree format
+- Score row: `📊 Score: 8.5/15  Gate≥4: ✅`
+- Sync row: `🔗 Sync: 3↑/1↓ of 4  Gate≥2: ✅`
 - PDH/PDL context
 - Operator commentary (if set)
 - SL Autopsy on stop hits
@@ -280,10 +387,15 @@ The 5-layer scoring engine hardcodes D/H4/H1/M15/M5 as its five layers. **M5 is 
 2. **Check PDH/PDL**: Is price above PDH (breakout), below PDL (breakdown), or inside range?
    - Inside range = lower probability. Wait for a range break or trade off the extremes.
 3. **Check Score**: Is `total_score ≥ 6` (bullish) or `≤ −6` (bearish)?
-   - Score 3–5: caution entries only; target TP1 only
-   - Score ≥ 6: full R:R trade; run to TP3 allowed
-   - Score < 3: stand aside; the 5 TFs are not aligned
-4. **Check MTF Pivots on dashboard**: `💧 MTF Pivots [15]: H=X L=Y`
+   - Score ±4–5: minimum gate met — half position, TP1/TP2 only *(v7.2 ScoreGate blocks if below ±4)*
+   - Score ±6–9: standard position, TP3 target
+   - Score ±10–15: full position, run TP3, activate Holder Mode runner
+   - Score < ±4: system will automatically block signals — stand aside
+4. **Check 4-Layer Sync**: Dashboard shows `🔗 Sync: N↑/M↓ of 4`. Default gate requires ≥ 2 aligned.
+   - 3–4 layers aligned: high conviction, trade full size
+   - 2 layers aligned: minimum gate met — reduce size
+   - 1 layer: gate blocks signal automatically
+5. **Check MTF Pivots on dashboard**: `💧 MTF Pivots [H1]: H=X L=Y`
    - For longs: price must be above the L= value (liqGate will enforce this automatically)
    - For shorts: price must be below the H= value
 
@@ -317,8 +429,9 @@ EURUSD | 5  1.09845
 ATM 🟢  Regime 📈
 VWAP 📈  Fib 📈
 RSI 📈 (62)  MACD: Bull
-🔒 FibGate: OFF  LiqGate: ✅ OK
-💧 MTF Pivots [15]: H=1.10023  L=1.09512
+🔒 FibGate: ✅ OK  LiqGate: ✅ OK
+📊 ScoreGate: ≥4 | 7.5/15 ✅  Sync: 3↑/1↓ ✅
+💧 MTF Pivots [60]: H=1.10023  L=1.09512
 ```
 
 Read this as:
@@ -326,8 +439,11 @@ Read this as:
 - `Regime 📈` — RSI momentum confirmed bullish
 - `VWAP 📈` — Adaptive VWAP swing is bullish
 - `Fib 📈` — Double-EMA trend is bullish
-- `LiqGate: ✅ OK` — Price is above the M15 structural demand floor
-- `MTF Pivots: L=1.09512` — The demand floor is 1.09512; as long as price holds above this, longs are structurally valid
+- `FibGate: ✅ OK` — FibTrend gate is ON and agrees (v7.2 default)
+- `LiqGate: ✅ OK` — Price is above the H1 structural demand floor
+- `ScoreGate: ≥4 | 7.5/15 ✅` — Score gate is active, current score 7.5 meets the ≥4 threshold
+- `Sync: 3↑/1↓ ✅` — 3 of 4 fractal layers bullish, meets min-2 sync gate
+- `MTF Pivots: L=1.09512` — The demand floor is 1.09512; longs are structurally valid above this
 
 #### What `⛔ BLOCKED` Means and What To Do
 - `FibGate: ⛔ Neut` — Fib trend is flat. If FibTrend gate is OFF this does not block; it is informational only.
@@ -355,10 +471,10 @@ This is the most important question, and it deserves an honest answer — not a 
 The system risks a fixed dollar amount per trade (default $15), not a percentage of account that compounds slippage decisions. Position size is calculated correctly per asset class (forex lots use 100k notional, crypto uses 1:1 notional). The partial exit model (33%→50%→75%) locks in progressively more profit while letting a runner work. This is the right structure.
 
 **2. Multiple confirmation layers reduce noise entries.**
-A raw ATM bot signal needs to pass: regime filter (RSI momentum), VWAP confirmation (optional), Fibonacci trend gate (optional), AND liquidity gate (structural position check). Each layer alone is imperfect. Together they should increase the signal-to-noise ratio significantly compared to a single ATR trail crossing.
+A raw ATM bot signal in v7.2 must pass up to 9 stacked gates before it fires: regime filter, Fibonacci trend, liquidity position, 5-layer composite score, 4-layer fractal sync, volume (optional), MACD (optional), and SMC structure (optional). Each layer alone is imperfect. Together they should increase the signal-to-noise ratio significantly compared to a single ATR trail crossing. All optional gates default OFF so the system is not paralysed for new users.
 
-**3. The 5-layer scoring is a genuine edge indicator.**
-A score of +12/15 means D, H4, H1, M15, and M5 are all screaming the same direction across three independent measures each. That is a real confluence reading. The weakest part is that the 5 TFs are hardcoded — you cannot tune them — but the defaults (D/H4/H1/M15/M5) are sensible for any intraday chart.
+**3. The 5-layer score now controls entry decisions, not just labels.**
+In v7.1 the composite score was a display metric — it appeared on the dashboard and in Telegram but had no effect on whether a signal fired. In v7.2, the score is wired into the signal chain via a 1-bar persistence gate. A score of +12/15 means D, H4, H1, M15, and M5 are all aligned across three independent measures each. This now *prevents entries* when the same factors that predict direction also say the edge is insufficient.
 
 **4. Liquidity gate is the single most valuable v7.1 addition.**
 The most common reason a technically valid ATM signal fails is that price is entering into a pocket of opposing order flow (a supply zone on a long, a demand zone on a short). The liqGate directly addresses this. It does not eliminate all losses, but it should reduce the number of losses that happen immediately after entry.
@@ -369,7 +485,7 @@ A system that explains its own losses in structured language gives you something
 ### What Can Undermine It
 
 **1. Signal frequency will be low when gates are strict.**
-With `requireRegime + requireLiqGate + requireFibTrend` all ON, you may see 1–3 signals per session day on M5. That is not a flaw — it is the price of quality. The danger is **boredom trading**: manually forcing entries when the agent says stand aside. The system cannot prevent that.
+With the full v7.2 gate chain active (Regime + FibGate + LiqGate + ScoreGate≥4 + SyncGate≥2), you may see 1–3 signals per session day on M5. That is not a flaw — it is the price of quality. The danger is **boredom trading**: manually forcing entries when the agent says stand aside. The rejected signal shapes (grey X) exist precisely to show you what was blocked and why. Honour them.
 
 **2. The 5-layer scoring hardcodes timeframes that may not match your chart TF.**
 The D/H4/H1/M15/M5 scoring tree is excellent when you trade M5. If you trade M15, the M5 layer of the scoring is now your H1 chart context, which creates drift. The system is architecturally built for M5 as the execution TF.
@@ -422,6 +538,9 @@ Based on the architecture:
 | **Regime** | RSI momentum state — Bullish when RSI > 55 with rising EMA5, Bearish when RSI < 50 with falling EMA5 |
 | **Liq Gate** | MTF Liquidity Gate — blocks entries on wrong structural side of a higher-TF pivot |
 | **Fib Gate** | Fibonacci Trend Gate — blocks entries against the double-EMA trend direction |
+| **Score Gate** *(v7.2)* | 5-layer composite score gate — blocks entries when `total_score` is below the configured threshold |
+| **Sync Gate** *(v7.2)* | 4-layer fractal sync gate — blocks entries when fewer than N of 4 layers agree with the signal direction |
+| **SMC Gate** *(v7.2)* | SMC Structure Gate — blocks entries that contradict `swingTrend.bias` (last confirmed BOS/CHoCH direction) |
 | **Holder Mode** | Active after TP3 hit — a 25% runner trails using VWAP, Structural pivot, or MTF Liq pivot |
 | **Glass Box** | The named principle: every alert includes transparent reasoning, not just a direction signal |
 | **Sovereign** | The highest-priority timeframe (Layer 1) — its direction is the macro veto |
@@ -438,4 +557,4 @@ Based on the architecture:
 ---
 
 *Not financial advice. Past signal behavior does not guarantee future performance.*
-*© 2026 Absolute Dollar Intelligence | ADSA v7.1 | Invite-Only*
+*© 2026 Absolute Dollar Intelligence | ADSA v7.2 | Invite-Only*
