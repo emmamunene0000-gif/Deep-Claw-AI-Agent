@@ -63,10 +63,20 @@ input bool   Inp_RequireFib   = false;  // Include Fib factor in score
 input double Inp_VP_W         = 0.5;    // Volume Profile weight (always in denominator — Pine default)
 input bool   Inp_VP_Enabled   = true;   // Include VP weight in max (Pine: vpEnabled=true)
 
+// Risk & Execution (Phase 2+3)
+input double Inp_Risk_Pct      = 1.0;   // Risk per trade (% of balance)
+input double Inp_Risk_USD      = 0.0;   // Fixed risk USD (0 = use % above)
+input double Inp_ScaleIn_Pct   = 0.5;   // Pyramid scale-in risk (% of balance)
+input int    Inp_Max_ScaleIns  = 2;     // Max pyramid additions per trade
+input double Inp_TP2_Trail_ATR = 0.75;  // ATR multiplier for trail tightening after TP2
+input bool   Inp_PyramidOn     = true;  // Enable smart pyramid scale-ins on newSmartBull/Bear
+
 //==========================================================================
 // MODULE 1: GLOBAL STATE
 //==========================================================================
-#define WARMUP_BARS 700
+#define WARMUP_BARS  700
+#define MAGIC_NUMBER 20240623
+#define MAX_TICKETS  12        // 4 primary slices + up to 8 scale-in additions
 
 // MTF Trail states (exec / M5 / M15 / H1)
 int    g_ltf_trend  = 1;  double g_ltf_trail  = 0.0;
@@ -137,6 +147,19 @@ int g_h_rsi_exec  = INVALID_HANDLE;  // RSI(14) exec TF
 int g_h_rsi_m5    = INVALID_HANDLE;  // RSI(14) M5 TF
 int g_h_ema5_exec = INVALID_HANDLE;  // EMA(5) exec TF — change_ema5
 int g_h_ema5_m5   = INVALID_HANDLE;  // EMA(5) M5   TF
+
+// Trade state (Phase 2+3)
+int    g_trade_dir      = 0;    // 1=long, -1=short, 0=flat
+int    g_trade_phase    = 0;    // 0=none 1=entry 2=tp1hit 3=tp2hit 4=runner
+double g_entry_price    = 0.0;
+double g_sl_price       = 0.0;
+double g_sl_dist        = 0.0;  // initial risk distance (1R)
+double g_tp1_price      = 0.0;
+double g_tp2_price      = 0.0;
+double g_tp3_price      = 0.0;
+ulong  g_tickets[MAX_TICKETS];
+int    g_ticket_count   = 0;    // filled ticket slots
+int    g_scale_in_count = 0;
 
 //==========================================================================
 // MODULE 2 HELPERS: calcLiqTrail (EMA-centered — exact Pine formula)
@@ -378,6 +401,312 @@ void UpdateVWAPDirection(long current_bar_idx)
    }
    g_dir_vwap      = dir;
    g_prev_dir_vwap = dir;
+}
+
+//==========================================================================
+// MODULE 11-13: PLATINUM RISK MODEL + ORDERSEND EXECUTION
+//==========================================================================
+
+// Risk-based lot size using symbol tick value (works for all Deriv instruments).
+double CalcLotSize(double entry, double sl, double risk_pct)
+{
+   double balance      = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_usd     = Inp_Risk_USD > 0.0 ? Inp_Risk_USD : balance * risk_pct / 100.0;
+   double sl_dist      = MathAbs(entry - sl);
+   if(sl_dist <= 0.0) return 0.0;
+   double tick_val     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick_val <= 0.0 || tick_size <= 0.0) return 0.0;
+   double risk_per_lot = (sl_dist / tick_size) * tick_val;
+   if(risk_per_lot <= 0.0) return 0.0;
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lots     = MathFloor((risk_usd / risk_per_lot) / lot_step) * lot_step;
+   return MathMax(min_lot, MathMin(max_lot, lots));
+}
+
+// Platinum Risk Model — derive SL from liquidity target.
+// Long:  BSL = g_prev_high.  sl_for_2rr = entry - (BSL-entry)/2.
+//         sl = MathMin(sl_for_2rr, ltf_trail)  →  widest coverage below entry.
+// Short: SSL = g_prev_low.   sl_for_2rr = entry + (entry-SSL)/2.
+//         sl = MathMax(sl_for_2rr, ltf_trail)  →  widest coverage above entry.
+// Falls back to ltf_trail when structure target is unavailable or invalid.
+double CalcPlatinumSL(int dir, double entry)
+{
+   if(dir > 0) {
+      double target = g_prev_high;
+      if(target > 0.0 && target > entry) {
+         double sl_for_2rr = entry - (target - entry) / 2.0;
+         return MathMin(sl_for_2rr, g_ltf_trail);
+      }
+      return g_ltf_trail;  // fallback
+   } else {
+      double target = g_prev_low;
+      if(target > 0.0 && target < entry) {
+         double sl_for_2rr = entry + (entry - target) / 2.0;
+         return MathMax(sl_for_2rr, g_ltf_trail);
+      }
+      return g_ltf_trail;  // fallback
+   }
+}
+
+// Modify SL on an open position. No-ops if position gone or change is sub-tick.
+bool ModifyPositionSL(ulong ticket, double new_sl)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   int    digits   = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double tick_sz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   new_sl = NormalizeDouble(new_sl, digits);
+   if(MathAbs(PositionGetDouble(POSITION_SL) - new_sl) < tick_sz) return true;
+   MqlTradeRequest req = {}; MqlTradeResult res = {};
+   req.action   = TRADE_ACTION_SLTP;
+   req.position = ticket;
+   req.symbol   = PositionGetString(POSITION_SYMBOL);
+   req.sl       = new_sl;
+   req.tp       = PositionGetDouble(POSITION_TP);
+   if(!OrderSend(req, res))
+      Print("[CLAW] ModifySL failed ticket=", ticket, " retcode=", res.retcode);
+   return res.retcode == TRADE_RETCODE_DONE;
+}
+
+// Close a position at market.
+bool ClosePosition(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   MqlTradeRequest req = {}; MqlTradeResult res = {};
+   req.action       = TRADE_ACTION_DEAL;
+   req.position     = ticket;
+   req.symbol       = PositionGetString(POSITION_SYMBOL);
+   req.volume       = PositionGetDouble(POSITION_VOLUME);
+   req.type         = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY
+                      ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   req.price        = req.type == ORDER_TYPE_SELL
+                      ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                      : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   req.type_filling = ORDER_FILLING_RETURN;
+   req.magic        = MAGIC_NUMBER;
+   if(!OrderSend(req, res))
+      Print("[CLAW] ClosePosition failed ticket=", ticket, " retcode=", res.retcode);
+   return res.retcode == TRADE_RETCODE_DONE;
+}
+
+// Open 4 equal-risk slices: Slice1→TP1 Slice2→TP2 Slice3→TP3 Runner→no TP.
+// sl_price already calculated by CalcPlatinumSL. Entry price from live ASK/BID.
+bool OpenTrade(int dir, double sl_price)
+{
+   int    digits    = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double entry     = NormalizeDouble(dir > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                              : SymbolInfoDouble(_Symbol, SYMBOL_BID), digits);
+   sl_price         = NormalizeDouble(sl_price, digits);
+   double sl_d      = MathAbs(entry - sl_price);
+   if(sl_d <= 0.0) { Print("[CLAW] OpenTrade: zero SL dist"); return false; }
+
+   // SL must be on the right side
+   if(dir > 0 && sl_price >= entry) { Print("[CLAW] OpenTrade: long SL above entry"); return false; }
+   if(dir < 0 && sl_price <= entry) { Print("[CLAW] OpenTrade: short SL below entry"); return false; }
+
+   double tp1 = NormalizeDouble(dir > 0 ? entry + sl_d       : entry - sl_d,       digits);
+   double tp2 = NormalizeDouble(dir > 0 ? entry + sl_d * 2.0 : entry - sl_d * 2.0, digits);
+   double tp3 = NormalizeDouble(dir > 0 ? entry + sl_d * 3.0 : entry - sl_d * 3.0, digits);
+
+   double total_lots = CalcLotSize(entry, sl_price, Inp_Risk_Pct);
+   double lot_step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double min_lot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double slice      = MathMax(min_lot, MathFloor((total_lots / 4.0) / lot_step) * lot_step);
+
+   if(slice < min_lot) {
+      Print("[CLAW] OpenTrade: slice lots ", slice, " < min ", min_lot, " — risk too small");
+      return false;
+   }
+
+   ENUM_ORDER_TYPE ot = dir > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   string   cms[4]  = {"CLAW_S1", "CLAW_S2", "CLAW_S3", "CLAW_RUN"};
+   double   tps[4]  = {tp1, tp2, tp3, 0.0};  // Runner has no TP
+
+   g_ticket_count  = 0;
+   g_scale_in_count = 0;
+   ArrayInitialize(g_tickets, 0);
+
+   int opened = 0;
+   for(int i = 0; i < 4; i++) {
+      MqlTradeRequest req = {}; MqlTradeResult res = {};
+      req.action       = TRADE_ACTION_DEAL;
+      req.symbol       = _Symbol;
+      req.type         = ot;
+      req.volume       = slice;
+      req.price        = entry;
+      req.sl           = sl_price;
+      req.tp           = tps[i];
+      req.type_filling = ORDER_FILLING_RETURN;
+      req.magic        = MAGIC_NUMBER;
+      req.comment      = cms[i];
+      if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE) {
+         g_tickets[g_ticket_count++] = res.order;
+         opened++;
+      } else {
+         Print("[CLAW] OrderSend slice ", i, " FAILED retcode=", res.retcode,
+               " comment=", res.comment);
+      }
+   }
+
+   if(opened > 0) {
+      g_trade_dir    = dir;
+      g_trade_phase  = 1;
+      g_entry_price  = entry;
+      g_sl_price     = sl_price;
+      g_sl_dist      = sl_d;
+      g_tp1_price    = tp1;
+      g_tp2_price    = tp2;
+      g_tp3_price    = tp3;
+      Print("[CLAW ENTRY] dir=", dir > 0 ? "LONG" : "SHORT",
+            " entry=", DoubleToString(entry, digits),
+            " sl=", DoubleToString(sl_price, digits),
+            " R=", DoubleToString(sl_d, digits),
+            " TP1=", DoubleToString(tp1, digits),
+            " TP2=", DoubleToString(tp2, digits),
+            " TP3=", DoubleToString(tp3, digits),
+            " lots/slice=", DoubleToString(slice, 2),
+            " opened=", opened, "/4");
+      return true;
+   }
+   return false;
+}
+
+// Add a pyramid position. Uses ltf_trail as SL, runner-style exit (no TP).
+bool OpenScaleIn(int dir)
+{
+   if(!Inp_PyramidOn || g_scale_in_count >= Inp_Max_ScaleIns) return false;
+   if(g_ticket_count >= MAX_TICKETS) return false;
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double entry  = NormalizeDouble(dir > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                           : SymbolInfoDouble(_Symbol, SYMBOL_BID), digits);
+   double sl     = NormalizeDouble(g_ltf_trail, digits);
+   if(MathAbs(entry - sl) <= 0.0) return false;
+   if(dir > 0 && sl >= entry) return false;
+   if(dir < 0 && sl <= entry) return false;
+   double lots = CalcLotSize(entry, sl, Inp_ScaleIn_Pct);
+   if(lots <= 0.0) return false;
+
+   MqlTradeRequest req = {}; MqlTradeResult res = {};
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = _Symbol;
+   req.type         = dir > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.volume       = lots;
+   req.price        = entry;
+   req.sl           = sl;
+   req.tp           = 0.0;
+   req.type_filling = ORDER_FILLING_RETURN;
+   req.magic        = MAGIC_NUMBER;
+   req.comment      = "CLAW_SC" + IntegerToString(g_scale_in_count + 1);
+   if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE) {
+      g_tickets[g_ticket_count++] = res.order;
+      g_scale_in_count++;
+      Print("[CLAW SCALE-IN #", g_scale_in_count, "]",
+            " dir=", dir > 0 ? "LONG" : "SHORT",
+            " entry=", DoubleToString(entry, digits),
+            " sl=ltf_trail=", DoubleToString(sl, digits),
+            " lots=", DoubleToString(lots, 2));
+      return true;
+   }
+   Print("[CLAW] Scale-in FAILED retcode=", res.retcode);
+   return false;
+}
+
+// Position exit + SL management — runs every tick.
+// Phase state machine:
+//   1 = all 4 slices open
+//   2 = TP1 hit → SLs moved to BE (entry)
+//   3 = TP2 hit → trail tightens to price ∓ ATR×TP2_Trail_ATR
+//   4 = TP3 hit → runner only, trail = ltf_trail (flip = exit)
+void ManageOpenTrade()
+{
+   if(g_trade_dir == 0 || g_trade_phase == 0) return;
+
+   // Determine which primary slices are still alive
+   bool s[4];
+   for(int i = 0; i < 4; i++)
+      s[i] = g_ticket_count > i && PositionSelectByTicket(g_tickets[i]);
+
+   bool any_open = s[0] || s[1] || s[2] || s[3];
+   if(!any_open) {
+      // Check scale-ins
+      for(int i = 4; i < g_ticket_count && !any_open; i++)
+         if(PositionSelectByTicket(g_tickets[i])) { any_open = true; break; }
+   }
+   if(!any_open) {
+      Print("[CLAW] All positions closed. Phase=", g_trade_phase, " Resetting.");
+      g_trade_dir = 0; g_trade_phase = 0;
+      g_ticket_count = 0; g_scale_in_count = 0;
+      return;
+   }
+
+   // Phase 1 → 2: Slice 1 gone (TP1 hit or manual close) but others alive
+   if(g_trade_phase == 1 && !s[0] && (s[1] || s[2] || s[3])) {
+      g_trade_phase = 2;
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      Print("[CLAW] TP1 HIT — moving all SLs to BE: ", DoubleToString(g_entry_price, digits));
+      for(int i = 1; i < g_ticket_count; i++)
+         ModifyPositionSL(g_tickets[i], g_entry_price);
+   }
+
+   // Phase 2 → 3: Slice 2 gone (TP2 hit)
+   if(g_trade_phase == 2 && !s[1] && (s[2] || s[3])) {
+      g_trade_phase = 3;
+      Print("[CLAW] TP2 HIT — tightening trail to price ± ATR×", Inp_TP2_Trail_ATR);
+   }
+
+   // Phase 3 → 4: Slice 3 gone (TP3 hit)
+   if(g_trade_phase == 3 && !s[2] && s[3]) {
+      g_trade_phase = 4;
+      Print("[CLAW] TP3 HIT — Runner mode. Trail=ltf_trail");
+   }
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Phase 3: tighten trail to current price ∓ ATR×0.75 each tick.
+   // Ratchet-only: SL only moves in favorable direction (never back against trade).
+   if(g_trade_phase == 3) {
+      double atr_buf[1];
+      if(CopyBuffer(g_h_atr_exec, 0, 1, 1, atr_buf) == 1) {
+         double raw_sl;
+         if(g_trade_dir > 0)
+            raw_sl = bid - atr_buf[0] * Inp_TP2_Trail_ATR;
+         else
+            raw_sl = ask + atr_buf[0] * Inp_TP2_Trail_ATR;
+         for(int i = 2; i < g_ticket_count; i++) {
+            if(!PositionSelectByTicket(g_tickets[i])) continue;
+            double cur_sl = PositionGetDouble(POSITION_SL);
+            // Ratchet: long → only move SL up. Short → only move SL down.
+            double trail_sl = g_trade_dir > 0
+                              ? MathMax(MathMax(g_entry_price, cur_sl), raw_sl)
+                              : MathMin(MathMin(g_entry_price, cur_sl), raw_sl);
+            ModifyPositionSL(g_tickets[i], trail_sl);
+         }
+      }
+   }
+
+   // Phase 4: Runner — SL tracks ltf_trail bar-by-bar.
+   // Exit if trend flips (trail crosses price — EA signals reversal).
+   if(g_trade_phase == 4) {
+      if(s[3]) ModifyPositionSL(g_tickets[3], g_ltf_trail);
+      // Also update any scale-in runners
+      for(int i = 4; i < g_ticket_count; i++)
+         if(PositionSelectByTicket(g_tickets[i]))
+            ModifyPositionSL(g_tickets[i], g_ltf_trail);
+      // Trend flip = time to exit runner (trail already manages the actual close,
+      // but we can force-close if needed in edge cases where broker SL fails)
+      bool flip = (g_trade_dir > 0 && g_ltf_trend == -1) ||
+                  (g_trade_dir < 0 && g_ltf_trend ==  1);
+      if(flip) {
+         Print("[CLAW] Runner: ltf_trail flipped — closing runner + scale-ins.");
+         if(s[3]) ClosePosition(g_tickets[3]);
+         for(int i = 4; i < g_ticket_count; i++)
+            if(PositionSelectByTicket(g_tickets[i])) ClosePosition(g_tickets[i]);
+      }
+   }
 }
 
 //==========================================================================
@@ -655,7 +984,11 @@ void OnDeinit(const int reason)
 //==========================================================================
 void OnTick()
 {
-   // Only process on new confirmed exec bar close
+   // Exit and SL management runs on every tick (not just bar close).
+   // Handles TP hit detection, BE move, trail tightening, runner SL, flip exit.
+   ManageOpenTrade();
+
+   // Signal detection and new entries only on new exec TF bar close.
    datetime cur_bar_time = iTime(_Symbol, PERIOD_CURRENT, 0);
    if(cur_bar_time == g_last_bar_time) return;  // same bar still forming
    g_last_bar_time = cur_bar_time;
@@ -884,58 +1217,64 @@ void OnTick()
    bool rejected_conf_short  = (gated_ut_sell || gated_smart_sell) && !bear_conf_pass;
 
    // ================================================================
-   // PHASE 1 OUTPUT — Print() only, no OrderSend
+   // EXECUTION + SIGNAL LOG
    // ================================================================
    datetime bar_time = iTime(_Symbol, PERIOD_CURRENT, 1);
-   string ts = TimeToString(bar_time, TIME_DATE | TIME_MINUTES);
+   string   ts       = TimeToString(bar_time, TIME_DATE | TIME_MINUTES);
 
-   if(final_long) {
+   // --- New trade entries (only when flat) ---
+   if(final_long && g_trade_dir == 0) {
+      double sl = CalcPlatinumSL(1, close_now);
       string src = final_ut_buy ? "UT" : "SMART";
-      Print("[CLAW LONG] ", ts,
-            " src=", src,
+      Print("[CLAW SIGNAL LONG] ", ts, " src=", src,
             " close=", DoubleToString(close_now, _Digits),
             " ltf_trail=", DoubleToString(g_ltf_trail, _Digits),
-            " bull_conf=", DoubleToString(bull_conf, 1), "%",
-            " mtf=", g_m15_trend, "/", g_h1_trend,
-            " struct=", g_struct_bias,
-            " rsi_pos=", g_positive,
-            " vwap=", g_last_swing,
-            " fib=", g_trend_fib);
+            " conf=", DoubleToString(bull_conf, 1), "%",
+            " BSL(target)=", DoubleToString(g_prev_high, _Digits),
+            " sl=", DoubleToString(sl, _Digits));
+      if(sl > 0.0) OpenTrade(1, sl);
    }
-   if(final_short) {
+
+   if(final_short && g_trade_dir == 0) {
+      double sl = CalcPlatinumSL(-1, close_now);
       string src = final_ut_sell ? "UT" : "SMART";
-      Print("[CLAW SHORT] ", ts,
-            " src=", src,
+      Print("[CLAW SIGNAL SHORT] ", ts, " src=", src,
             " close=", DoubleToString(close_now, _Digits),
             " ltf_trail=", DoubleToString(g_ltf_trail, _Digits),
-            " bear_conf=", DoubleToString(bear_conf, 1), "%",
-            " mtf=", g_m15_trend, "/", g_h1_trend,
-            " struct=", g_struct_bias,
-            " rsi_neg=", g_negative,
-            " vwap=", g_last_swing,
-            " fib=", g_trend_fib);
+            " conf=", DoubleToString(bear_conf, 1), "%",
+            " SSL(target)=", DoubleToString(g_prev_low, _Digits),
+            " sl=", DoubleToString(sl, _Digits));
+      if(sl > 0.0) OpenTrade(-1, sl);
    }
 
-   // Rejected signals — diagnostic log
-   if(rejected_trail_long)
-      Print("[CLAW REJECTED trail] LONG trigger blocked — ltf_trend=", g_ltf_trend, " ts=", ts);
-   if(rejected_trail_short)
-      Print("[CLAW REJECTED trail] SHORT trigger blocked — ltf_trend=", g_ltf_trend, " ts=", ts);
-   if(rejected_conf_long)
-      Print("[CLAW REJECTED conf]  LONG gated but conf=", DoubleToString(bull_conf, 1), "% < ", threshold, " ts=", ts);
-   if(rejected_conf_short)
-      Print("[CLAW REJECTED conf]  SHORT gated but conf=", DoubleToString(bear_conf, 1), "% < ", threshold, " ts=", ts);
+   // --- Pyramid scale-ins when already in a trade ---
+   // newSmartBull/Bear = fresh momentum cross confirms direction — add to winner.
+   if(Inp_PyramidOn && g_trade_dir != 0 && g_trade_phase >= 1) {
+      if(new_smart_bull && g_trade_dir == 1)  OpenScaleIn(1);
+      if(new_smart_bear && g_trade_dir == -1) OpenScaleIn(-1);
+   }
 
-   // Periodic state pulse (every 60 bars) — lets you compare against Pine dashboard
+   // --- Rejected signal diagnostics ---
+   if(rejected_trail_long)
+      Print("[CLAW REJECT trail] LONG blocked ltf_trend=", g_ltf_trend, " ts=", ts);
+   if(rejected_trail_short)
+      Print("[CLAW REJECT trail] SHORT blocked ltf_trend=", g_ltf_trend, " ts=", ts);
+   if(rejected_conf_long)
+      Print("[CLAW REJECT conf]  LONG conf=", DoubleToString(bull_conf,1), "% < ", threshold, " ts=", ts);
+   if(rejected_conf_short)
+      Print("[CLAW REJECT conf]  SHORT conf=", DoubleToString(bear_conf,1), "% < ", threshold, " ts=", ts);
+
+   // --- Periodic state pulse every 60 bars (compare against Pine dashboard) ---
    if(g_bar_count % 60 == 0) {
       Print("[CLAW STATE] bars=", g_bar_count,
+            " trade_dir=", g_trade_dir, " phase=", g_trade_phase,
             " ltf=", g_ltf_trend, " m5=", g_m5_trend,
             " m15=", g_m15_trend, " h1=", g_h1_trend,
-            " atm_buy_trail=", DoubleToString(g_trail_buy, _Digits),
-            " atm_sell_trail=", DoubleToString(g_trail_sell, _Digits),
+            " atm_buy=", DoubleToString(g_trail_buy, _Digits),
+            " atm_sell=", DoubleToString(g_trail_sell, _Digits),
             " pos=", g_positive, " neg=", g_negative,
             " struct=", g_struct_bias,
-            " fib=", g_trend_fib, " vwap_dir=", g_last_swing,
+            " fib=", g_trend_fib, " vwap=", g_last_swing,
             " bull_conf=", DoubleToString(bull_conf, 1),
             " bear_conf=", DoubleToString(bear_conf, 1));
    }
