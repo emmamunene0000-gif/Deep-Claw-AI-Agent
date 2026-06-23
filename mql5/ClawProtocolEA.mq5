@@ -60,6 +60,8 @@ input double Inp_RSI_W        = 1.0;    // RSI weight
 input double Inp_VWAP_W       = 1.0;    // VWAP weight
 input double Inp_Fib_W        = 0.5;    // Fib weight (active if RequireFib)
 input bool   Inp_RequireFib   = false;  // Include Fib factor in score
+input double Inp_VP_W         = 0.5;    // Volume Profile weight (always in denominator — Pine default)
+input bool   Inp_VP_Enabled   = true;   // Include VP weight in max (Pine: vpEnabled=true)
 
 //==========================================================================
 // MODULE 1: GLOBAL STATE
@@ -84,8 +86,10 @@ bool   g_positive    = false;
 bool   g_negative    = false;
 bool   g_positive_m5 = false;
 bool   g_negative_m5 = false;
-double g_ema5_prev   = 0.0;   // EMA5(close) on exec TF, previous bar
-double g_ema5_m5_prev = 0.0;  // EMA5(close) on M5, previous bar
+double g_ema5_prev    = 0.0;   // EMA5(close) on exec TF, previous bar
+double g_ema5_m5_prev = 0.0;   // EMA5(close) on M5, previous bar
+double g_rsi_prev     = 0.0;   // RSI on exec TF, previous bar (for p_mom crossing check)
+double g_rsi_m5_prev  = 0.0;   // RSI on M5, previous bar
 bool   g_smart_bull      = false;
 bool   g_smart_bear      = false;
 bool   g_prev_smart_bull = false;
@@ -127,7 +131,8 @@ int g_h_ema_m15   = INVALID_HANDLE;
 int g_h_atr_m15   = INVALID_HANDLE;
 int g_h_ema_h1    = INVALID_HANDLE;
 int g_h_atr_h1    = INVALID_HANDLE;
-int g_h_atr_atm   = INVALID_HANDLE;  // ATR(2) exec TF — for ATM Bot
+int g_h_atr_atm_buy  = INVALID_HANDLE;  // ATR(c_buy)  exec TF — ATM Bot buy trail
+int g_h_atr_atm_sell = INVALID_HANDLE;  // ATR(c_sell) exec TF — ATM Bot sell trail
 int g_h_rsi_exec  = INVALID_HANDLE;  // RSI(14) exec TF
 int g_h_rsi_m5    = INVALID_HANDLE;  // RSI(14) M5 TF
 int g_h_ema5_exec = INVALID_HANDLE;  // EMA(5) exec TF — change_ema5
@@ -205,25 +210,6 @@ void StepATMTrail(double close_curr, double close_prev,
       trail = close_curr > trail ? close_curr - nLoss : close_curr + nLoss;
 }
 
-void WarmupATMBotTrails(const double &close_arr[], const double &atr_arr[],
-                        double a_buy, double a_sell)
-{
-   int n = MathMin(ArraySize(close_arr), ArraySize(atr_arr));
-   if(n < 1) return;
-   // Pine init: trail_buy starts below price, trail_sell starts above
-   g_trail_buy  = close_arr[0] - a_buy  * atr_arr[0];
-   g_trail_sell = close_arr[0] + a_sell * atr_arr[0];
-   for(int i = 1; i < n; i++) {
-      double c  = close_arr[i];
-      double cp = close_arr[i - 1];
-      StepATMTrail(c, cp, a_buy  * atr_arr[i], g_trail_buy);
-      StepATMTrail(c, cp, a_sell * atr_arr[i], g_trail_sell);
-   }
-   // Store last close for next crossover check
-   g_prev_close_atm  = close_arr[n - 1];
-   g_prev_trail_buy  = g_trail_buy;
-   g_prev_trail_sell = g_trail_sell;
-}
 
 //==========================================================================
 // MODULE 4 HELPERS: RSI Momentum (replay for warmup)
@@ -373,16 +359,16 @@ void WarmupFibEMA(const double &hlc3_arr[], int len,
 // vs most recent lowest low in last prd bars.
 // dir = vw_phL > vw_plL ? 1 : -1   (more-recent pivot wins)
 // lastSwing updates only when direction changes.
+// NOTE: uses shift=1 so we evaluate on the last CONFIRMED bar (matches Pine
+// semantics: ta.highestbars evaluates at confirmed bar close, not on forming bar).
 void UpdateVWAPDirection(long current_bar_idx)
 {
-   // iHighest/iLowest shift=0 means check from current bar
-   int hb = (int)iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, Inp_VWAP_Prd, 0);
-   int lb = (int)iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  Inp_VWAP_Prd, 0);
-   // hb/lb are SHIFTS (0=current). Convert to bar_index-style: bar_idx - shift
+   // shift=1: start search from last confirmed bar, not forming bar.
+   // hb/lb == 0 means the bar at shift=1 (last confirmed) has the extreme.
+   int hb = (int)iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, Inp_VWAP_Prd, 1);
+   int lb = (int)iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  Inp_VWAP_Prd, 1);
    if(hb == 0) g_vwap_phL = current_bar_idx;
    if(lb == 0) g_vwap_plL = current_bar_idx;
-   // if highestbars/lowestbars returned non-zero, the bar phL/plL was updated on that past bar
-   // — we track updates only when 0 (current bar IS the extreme)
 
    int dir = g_vwap_phL > g_vwap_plL ? 1 : -1;
    if(dir != g_prev_dir_vwap && g_prev_dir_vwap != 0) {
@@ -405,8 +391,10 @@ int ConfidenceThreshold()
    return 60; // Moderate (default)
 }
 
+// vp_bull: true when close > VAL (volume profile bullish confirmation).
+// Phase 1: caller passes vp_bull=true (permissive) until VP is implemented.
 double ComputeConfidence(bool mtf_full, bool mtf_partial, bool struct_bull,
-                         bool rsi_bull, bool vwap_bull, bool fib_bull)
+                         bool rsi_bull, bool vwap_bull, bool fib_bull, bool vp_bull)
 {
    double score = 0.0, max_w = 0.0;
    // MTF (full = both M15+H1, partial = one of them)
@@ -421,10 +409,16 @@ double ComputeConfidence(bool mtf_full, bool mtf_partial, bool struct_bull,
    // VWAP
    score += vwap_bull ? Inp_VWAP_W : 0.0;
    max_w += Inp_VWAP_W;
-   // Fib (optional gate)
+   // Fib (optional — Pine: requireFibTrend input, default false)
    if(Inp_RequireFib) {
       score += fib_bull ? Inp_Fib_W : 0.0;
       max_w += Inp_Fib_W;
+   }
+   // Volume Profile — Pine always includes when vpEnabled=true (default).
+   // Phase 1: vp_bull passed as true (permissive) until VP engine is built.
+   if(Inp_VP_Enabled) {
+      score += vp_bull ? Inp_VP_W : 0.0;
+      max_w += Inp_VP_W;
    }
    return max_w > 0.0 ? (score / max_w) * 100.0 : 0.0;
 }
@@ -443,20 +437,21 @@ int OnInit()
    g_h_atr_m15   = iATR(_Symbol, PERIOD_M15, Inp_ATR_Len);
    g_h_ema_h1    = iMA(_Symbol, PERIOD_H1,  Inp_MA_Len, 0, MODE_EMA, PRICE_CLOSE);
    g_h_atr_h1    = iATR(_Symbol, PERIOD_H1,  Inp_ATR_Len);
-   g_h_atr_atm   = iATR(_Symbol, PERIOD_CURRENT, Inp_C_Buy);  // ATR(2) for ATM Bot
+   g_h_atr_atm_buy  = iATR(_Symbol, PERIOD_CURRENT, Inp_C_Buy);
+   g_h_atr_atm_sell = iATR(_Symbol, PERIOD_CURRENT, Inp_C_Sell);
    g_h_rsi_exec  = iRSI(_Symbol, PERIOD_CURRENT, Inp_RSI_Len, PRICE_CLOSE);
    g_h_rsi_m5    = iRSI(_Symbol, PERIOD_M5,  Inp_RSI_Len, PRICE_CLOSE);
    g_h_ema5_exec = iMA(_Symbol, PERIOD_CURRENT, Inp_RSI_EMA_Len, 0, MODE_EMA, PRICE_CLOSE);
    g_h_ema5_m5   = iMA(_Symbol, PERIOD_M5,  Inp_RSI_EMA_Len, 0, MODE_EMA, PRICE_CLOSE);
 
    // Validate handles
-   if(g_h_ema_exec == INVALID_HANDLE || g_h_atr_exec == INVALID_HANDLE ||
-      g_h_ema_m5   == INVALID_HANDLE || g_h_atr_m5   == INVALID_HANDLE ||
-      g_h_ema_m15  == INVALID_HANDLE || g_h_atr_m15  == INVALID_HANDLE ||
-      g_h_ema_h1   == INVALID_HANDLE || g_h_atr_h1   == INVALID_HANDLE ||
-      g_h_atr_atm  == INVALID_HANDLE || g_h_rsi_exec  == INVALID_HANDLE ||
-      g_h_rsi_m5   == INVALID_HANDLE || g_h_ema5_exec == INVALID_HANDLE ||
-      g_h_ema5_m5  == INVALID_HANDLE)
+   if(g_h_ema_exec      == INVALID_HANDLE || g_h_atr_exec  == INVALID_HANDLE ||
+      g_h_ema_m5        == INVALID_HANDLE || g_h_atr_m5    == INVALID_HANDLE ||
+      g_h_ema_m15       == INVALID_HANDLE || g_h_atr_m15   == INVALID_HANDLE ||
+      g_h_ema_h1        == INVALID_HANDLE || g_h_atr_h1    == INVALID_HANDLE ||
+      g_h_atr_atm_buy   == INVALID_HANDLE || g_h_atr_atm_sell == INVALID_HANDLE ||
+      g_h_rsi_exec      == INVALID_HANDLE || g_h_rsi_m5    == INVALID_HANDLE ||
+      g_h_ema5_exec     == INVALID_HANDLE || g_h_ema5_m5   == INVALID_HANDLE)
    {
       Print("[CLAW] ERROR: Failed to create indicator handles.");
       return INIT_FAILED;
@@ -499,40 +494,58 @@ int OnInit()
          WarmupLiqTrail(ema_a, atr_a, cl_a, Inp_ATR_Mult, g_h1_trend, g_h1_trail);
    }
 
-   // --- Warmup ATM Bot trails ---
+   // --- Warmup ATM Bot trails (uses confirmed bars only: shift=1) ---
    {
-      double cl_a[], atr_a[];
-      int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_atr_atm));
+      double cl_a[], atr_buy_a[], atr_sell_a[];
+      int bars = MathMin(WARMUP_BARS, MathMin(BarsCalculated(g_h_atr_atm_buy),
+                                              BarsCalculated(g_h_atr_atm_sell)));
       if(bars >= 10) {
-         CopyClose(_Symbol, PERIOD_CURRENT, 0, bars, cl_a);
-         CopyBuffer(g_h_atr_atm, 0, 0, bars, atr_a);
-         ArrayReverse(cl_a); ArrayReverse(atr_a);
-         WarmupATMBotTrails(cl_a, atr_a, Inp_A_Buy, Inp_A_Sell);
+         CopyClose(_Symbol, PERIOD_CURRENT, 1, bars, cl_a);
+         CopyBuffer(g_h_atr_atm_buy,  0, 1, bars, atr_buy_a);
+         CopyBuffer(g_h_atr_atm_sell, 0, 1, bars, atr_sell_a);
+         ArrayReverse(cl_a); ArrayReverse(atr_buy_a); ArrayReverse(atr_sell_a);
+         // Warmup with separate buy/sell ATR arrays
+         int n = MathMin(ArraySize(cl_a), MathMin(ArraySize(atr_buy_a), ArraySize(atr_sell_a)));
+         if(n >= 1) {
+            g_trail_buy  = cl_a[0] - Inp_A_Buy  * atr_buy_a[0];
+            g_trail_sell = cl_a[0] + Inp_A_Sell * atr_sell_a[0];
+            for(int i = 1; i < n; i++) {
+               double c = cl_a[i], cp = cl_a[i - 1];
+               StepATMTrail(c, cp, Inp_A_Buy  * atr_buy_a[i],  g_trail_buy);
+               StepATMTrail(c, cp, Inp_A_Sell * atr_sell_a[i], g_trail_sell);
+            }
+            g_prev_close_atm  = cl_a[n - 1];
+            g_prev_trail_buy  = g_trail_buy;
+            g_prev_trail_sell = g_trail_sell;
+         }
       }
    }
 
-   // --- Warmup RSI state ---
+   // --- Warmup RSI state (confirmed bars: shift=1) ---
    {
       double rsi_a[], ema5_a[];
       int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_rsi_exec));
       if(bars >= 20) {
-         CopyBuffer(g_h_rsi_exec,  0, 0, bars, rsi_a);
-         CopyBuffer(g_h_ema5_exec, 0, 0, bars, ema5_a);
+         CopyBuffer(g_h_rsi_exec,  0, 1, bars, rsi_a);
+         CopyBuffer(g_h_ema5_exec, 0, 1, bars, ema5_a);
          ArrayReverse(rsi_a); ArrayReverse(ema5_a);
          WarmupRSIState(rsi_a, ema5_a, Inp_PMom, Inp_NMom, Inp_Sustain,
                         g_positive, g_negative, g_ema5_prev);
+         // Seed previous-RSI for crossing check in OnTick
+         g_rsi_prev = (ArraySize(rsi_a) >= 2) ? rsi_a[ArraySize(rsi_a) - 2] : 0.0;
       }
    }
-   // --- Warmup M5 RSI state ---
+   // --- Warmup M5 RSI state (confirmed bars: shift=1) ---
    {
       double rsi_a[], ema5_a[];
       int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_rsi_m5));
       if(bars >= 20) {
-         CopyBuffer(g_h_rsi_m5,  0, 0, bars, rsi_a);
-         CopyBuffer(g_h_ema5_m5, 0, 0, bars, ema5_a);
+         CopyBuffer(g_h_rsi_m5,  0, 1, bars, rsi_a);
+         CopyBuffer(g_h_ema5_m5, 0, 1, bars, ema5_a);
          ArrayReverse(rsi_a); ArrayReverse(ema5_a);
          WarmupRSIState(rsi_a, ema5_a, Inp_PMom, Inp_NMom, Inp_Sustain,
                         g_positive_m5, g_negative_m5, g_ema5_m5_prev);
+         g_rsi_m5_prev = (ArraySize(rsi_a) >= 2) ? rsi_a[ArraySize(rsi_a) - 2] : 0.0;
       }
    }
 
@@ -600,18 +613,22 @@ int OnInit()
       }
    }
 
-   // --- Init VWAP state ---
-   g_bar_count    = (long)Bars(_Symbol, PERIOD_CURRENT);
-   g_vwap_phL     = g_bar_count - (long)iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, Inp_VWAP_Prd, 0);
-   g_vwap_plL     = g_bar_count - (long)iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  Inp_VWAP_Prd, 0);
-   g_dir_vwap     = g_vwap_phL > g_vwap_plL ? 1 : -1;
-   g_last_swing   = g_dir_vwap;
+   // --- Init VWAP state (shift=1: evaluate from last confirmed bar, not forming) ---
+   g_bar_count = (long)Bars(_Symbol, PERIOD_CURRENT) - 1; // exclude forming bar
+   g_vwap_phL  = g_bar_count - (long)iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, Inp_VWAP_Prd, 1);
+   g_vwap_plL  = g_bar_count - (long)iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  Inp_VWAP_Prd, 1);
+   g_dir_vwap  = g_vwap_phL > g_vwap_plL ? 1 : -1;
+   g_last_swing = g_dir_vwap;
    g_prev_dir_vwap = g_dir_vwap;
 
-   CopyTime(_Symbol, PERIOD_CURRENT, 0, 1, &g_last_bar_time);
-   CopyTime(_Symbol, PERIOD_M5,      0, 1, &g_last_m5_time);
-   CopyTime(_Symbol, PERIOD_M15,     0, 1, &g_last_m15_time);
-   CopyTime(_Symbol, PERIOD_H1,      0, 1, &g_last_h1_time);
+   // CopyTime requires a datetime array, not a scalar reference
+   {
+      datetime tmp[1];
+      CopyTime(_Symbol, PERIOD_CURRENT, 0, 1, tmp); g_last_bar_time  = tmp[0];
+      CopyTime(_Symbol, PERIOD_M5,      0, 1, tmp); g_last_m5_time   = tmp[0];
+      CopyTime(_Symbol, PERIOD_M15,     0, 1, tmp); g_last_m15_time  = tmp[0];
+      CopyTime(_Symbol, PERIOD_H1,      0, 1, tmp); g_last_h1_time   = tmp[0];
+   }
 
    Print("[CLAW] Phase 1 init complete. ltf_trend=", g_ltf_trend,
          " m15_trend=", g_m15_trend, " h1_trend=", g_h1_trend,
@@ -625,10 +642,10 @@ int OnInit()
 //==========================================================================
 void OnDeinit(const int reason)
 {
-   int handles[] = {g_h_ema_exec, g_h_atr_exec, g_h_ema_m5,   g_h_atr_m5,
-                    g_h_ema_m15,  g_h_atr_m15,  g_h_ema_h1,   g_h_atr_h1,
-                    g_h_atr_atm,  g_h_rsi_exec,  g_h_rsi_m5,
-                    g_h_ema5_exec, g_h_ema5_m5};
+   int handles[] = {g_h_ema_exec, g_h_atr_exec, g_h_ema_m5,      g_h_atr_m5,
+                    g_h_ema_m15,  g_h_atr_m15,  g_h_ema_h1,      g_h_atr_h1,
+                    g_h_atr_atm_buy, g_h_atr_atm_sell,
+                    g_h_rsi_exec, g_h_rsi_m5,   g_h_ema5_exec,   g_h_ema5_m5};
    for(int i = 0; i < ArraySize(handles); i++)
       if(handles[i] != INVALID_HANDLE) IndicatorRelease(handles[i]);
 }
@@ -697,58 +714,66 @@ void OnTick()
 
    // ================================================================
    // MODULE 3: ATM Bot — update dual trails + detect crossover
+   // Pine uses separate ATR series for buy (ATR(c_buy)) and sell (ATR(c_sell)).
    // ================================================================
    bool ut_buy_signal  = false;
    bool ut_sell_signal = false;
-   if(CopyBuffer(g_h_atr_atm, 0, 1, 1, buf1) == 1) {
-      double nLoss_buy  = Inp_A_Buy  * buf1[0];
-      double nLoss_sell = Inp_A_Sell * buf1[0];
-      double cp = g_prev_close_atm;    // close[1] in Pine terms
-      double ptb = g_prev_trail_buy;
-      double pts = g_prev_trail_sell;
-      // Update trail_buy
-      StepATMTrail(close_now, cp, nLoss_buy,  g_trail_buy);
-      // Update trail_sell
-      StepATMTrail(close_now, cp, nLoss_sell, g_trail_sell);
-      // Crossover detection (Pine: ta.crossover(ema_buy, trail_buy))
-      // ema_buy = EMA(close,1) = close. crossover = curr > trail AND prev <= prev_trail
-      bool above_buy_cross  = close_now > g_trail_buy  && cp <= ptb;
-      bool below_sell_cross = g_trail_sell > close_now && pts <= cp;
-      ut_buy_signal  = close_now > g_trail_buy  && above_buy_cross;
-      ut_sell_signal = close_now < g_trail_sell && below_sell_cross;
-      g_prev_close_atm  = close_now;
-      g_prev_trail_buy  = g_trail_buy;
-      g_prev_trail_sell = g_trail_sell;
+   {
+      double atr_buy_v = 0.0, atr_sell_v = 0.0;
+      bool got_buy  = CopyBuffer(g_h_atr_atm_buy,  0, 1, 1, buf1) == 1;
+      if(got_buy) atr_buy_v = buf1[0];
+      bool got_sell = CopyBuffer(g_h_atr_atm_sell, 0, 1, 1, buf1) == 1;
+      if(got_sell) atr_sell_v = buf1[0];
+
+      if(got_buy && got_sell) {
+         double cp  = g_prev_close_atm;
+         double ptb = g_prev_trail_buy;
+         double pts = g_prev_trail_sell;
+         StepATMTrail(close_now, cp, Inp_A_Buy  * atr_buy_v,  g_trail_buy);
+         StepATMTrail(close_now, cp, Inp_A_Sell * atr_sell_v, g_trail_sell);
+         // Pine: ta.crossover(ema_buy, trail_buy) = close > trail AND close[1] <= trail[1]
+         bool above_buy_cross  = close_now > g_trail_buy  && cp <= ptb;
+         bool below_sell_cross = g_trail_sell > close_now && pts <= cp;
+         ut_buy_signal  = above_buy_cross;
+         ut_sell_signal = below_sell_cross;
+         g_prev_close_atm  = close_now;
+         g_prev_trail_buy  = g_trail_buy;
+         g_prev_trail_sell = g_trail_sell;
+      }
    }
 
    // ================================================================
    // MODULE 4: RSI Smart Signal + M5 confirm + sustain
+   // Pine p_mom: rsi[1] < pmom AND rsi > pmom (crossing from below).
+   // We track g_rsi_prev for the prior-bar check.
    // ================================================================
    double rsi_val = 0.0, ema5_val = 0.0;
    if(CopyBuffer(g_h_rsi_exec,  0, 1, 1, buf1) == 1) rsi_val  = buf1[0];
    if(CopyBuffer(g_h_ema5_exec, 0, 1, 1, buf1) == 1) ema5_val = buf1[0];
    double ch_ema5 = ema5_val - g_ema5_prev;
-   // Pine: p_mom = rsi[1] < pmom and rsi > pmom and ...
-   // In confirmed-bar mode, rsi[1] = previous bar's value.
-   // We track the state from previous iteration so use rsi from buf[1] vs buf[0] trick:
-   // For simplicity, use current rsi > pmom (state machine handles continuity via g_positive).
-   bool p_mom  = rsi_val > Inp_PMom && ch_ema5 > 0.0 && !g_positive;
-   bool n_mom  = rsi_val < Inp_NMom && ch_ema5 < 0.0 && !g_negative;
+   // Pine line 627: p_mom = rsi[1] < pmom AND rsi > pmom AND rsi > nmom AND change_ema5 > 0
+   bool p_mom  = g_rsi_prev < Inp_PMom && rsi_val > Inp_PMom && rsi_val > Inp_NMom && ch_ema5 > 0.0;
+   // Pine line 628: n_mom = rsi < nmom AND change_ema5 < 0  (no prior-bar crossing needed)
+   bool n_mom  = rsi_val < Inp_NMom && ch_ema5 < 0.0;
    bool p_sust = Inp_Sustain && g_positive && rsi_val > Inp_PMom && ch_ema5 > 0.0;
    bool n_sust = Inp_Sustain && g_negative && rsi_val < Inp_NMom && ch_ema5 < 0.0;
    if(p_mom || p_sust) { g_positive = true;  g_negative = false; }
    if(n_mom || n_sust) { g_positive = false; g_negative = true;  }
+   g_rsi_prev  = rsi_val;
    g_ema5_prev = ema5_val;
 
-   // M5 RSI state
+   // M5 RSI state — use shift=1 to read the last CONFIRMED M5 bar (not forming).
+   // Pine: request.security uses last closed bar of the TF (lookahead_off default).
    double rsi_m5 = 0.0, ema5_m5 = 0.0;
-   if(CopyBuffer(g_h_rsi_m5,  0, 0, 1, buf1) == 1) rsi_m5  = buf1[0];
-   if(CopyBuffer(g_h_ema5_m5, 0, 0, 1, buf1) == 1) ema5_m5 = buf1[0];
+   if(CopyBuffer(g_h_rsi_m5,  0, 1, 1, buf1) == 1) rsi_m5  = buf1[0];
+   if(CopyBuffer(g_h_ema5_m5, 0, 1, 1, buf1) == 1) ema5_m5 = buf1[0];
    double ch_ema5_m5 = ema5_m5 - g_ema5_m5_prev;
-   bool p_mom_m5 = rsi_m5 > Inp_PMom && ch_ema5_m5 > 0.0 && !g_positive_m5;
-   bool n_mom_m5 = rsi_m5 < Inp_NMom && ch_ema5_m5 < 0.0 && !g_negative_m5;
+   // Pine line 648: p_mom_m5 = rsi_m5[1] < pmom AND rsi_m5 > pmom (crossing)
+   bool p_mom_m5 = g_rsi_m5_prev < Inp_PMom && rsi_m5 > Inp_PMom && ch_ema5_m5 > 0.0;
+   bool n_mom_m5 = rsi_m5 < Inp_NMom && ch_ema5_m5 < 0.0;
    if(p_mom_m5) { g_positive_m5 = true;  g_negative_m5 = false; }
    if(n_mom_m5) { g_positive_m5 = false; g_negative_m5 = true;  }
+   g_rsi_m5_prev  = rsi_m5;
    g_ema5_m5_prev = ema5_m5;
 
    // smartBull / smartBear (Pine: rsi > pmom and change_ema5 > 0 and m5 confirm)
@@ -770,9 +795,11 @@ void OnTick()
    {
       int scan = Inp_SwingSize * 2 + 5;
       double h_arr[], l_arr[], c_arr[];
-      if(CopyHigh(_Symbol, PERIOD_CURRENT, 1, scan, h_arr) == scan &&
-         CopyLow( _Symbol, PERIOD_CURRENT, 1, scan, l_arr) == scan &&
-         CopyClose(_Symbol, PERIOD_CURRENT, 0, scan, c_arr) == scan)
+      // All three use shift=1 so the close for BOS is the confirmed bar close,
+      // matching Pine: highSrc = close (bosConfType='Candle Close').
+      if(CopyHigh( _Symbol, PERIOD_CURRENT, 1, scan, h_arr) == scan &&
+         CopyLow(  _Symbol, PERIOD_CURRENT, 1, scan, l_arr) == scan &&
+         CopyClose(_Symbol, PERIOD_CURRENT, 1, scan, c_arr) == scan)
       {
          UpdateStructure(h_arr, l_arr, c_arr, bull_bos, bear_bos);
       }
@@ -795,11 +822,9 @@ void OnTick()
    UpdateVWAPDirection(g_bar_count);
 
    // ================================================================
-   // MODULE 8: Volume Profile — placeholder
-   // Phase 3 implementation. Always permissive for Phase 1.
+   // MODULE 8: Volume Profile — Phase 3 implementation.
+   // Permissive (true) for Phase 1; score slot held in denominator via Inp_VP_Enabled.
    // ================================================================
-   bool vp_bull_conf = true;
-   bool vp_bear_conf = true;
 
    // ================================================================
    // MODULE 9 + 10: Confidence Engine + Gate Chain
@@ -821,10 +846,11 @@ void OnTick()
    bool fib_bull = (g_trend_fib == 1);
    bool fib_bear = (g_trend_fib == -1);
 
+   // VP Phase 1: permissive — both directions allowed (no score contribution)
    double bull_conf = ComputeConfidence(mtf_bull_full, mtf_partial_bull, struct_bull,
-                                        g_positive, vwap_bull, fib_bull);
+                                        g_positive, vwap_bull, fib_bull, true);
    double bear_conf = ComputeConfidence(mtf_bear_full, mtf_partial_bear, struct_bear,
-                                        g_negative, vwap_bear, fib_bear);
+                                        g_negative, vwap_bear, fib_bear, true);
 
    int threshold = ConfidenceThreshold();
    bool bull_conf_pass = bull_conf >= threshold;
