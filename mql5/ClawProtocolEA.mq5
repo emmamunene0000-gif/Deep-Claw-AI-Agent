@@ -1,0 +1,1282 @@
+//+------------------------------------------------------------------+
+//| ClawProtocolEA.mq5 — Phase 1: Signal Validation (Print Only)   |
+//|                                                                  |
+//| Full port of THE CLAW PROTOCOL from Pine Script v6.             |
+//| Phase 1: Zero OrderSend. Print() to Experts log only.           |
+//| Goal: final_long / final_short match Pine output bar-for-bar.   |
+//|                                                                  |
+//| Architecture (mirrors Pine STEP order):                         |
+//|  Module 2: calcLiqTrail — exec/M5/M15/H1 (EMA-centered, exact) |
+//|  Module 3: ATM Bot — dual trails + crossover trigger            |
+//|  Module 4: RSI Smart Signal + M5 confirm + sustain              |
+//|  Module 5: Market Structure — pivot HH/HL/LH/LL + BOS          |
+//|  Module 6: Fib Bands — double-EMA of HLC3                      |
+//|  Module 7: VWAP Direction — highestbars/lowestbars anchor       |
+//|  Module 8: Volume Profile — placeholder (Phase 3)               |
+//|  Module 9: Confidence Engine — 6-factor weighted                |
+//|  Module 10: Gate Chain → final_long / final_short               |
+//+------------------------------------------------------------------+
+#property copyright "Deep Claw"
+#property version   "1.0"
+#property strict
+
+//==========================================================================
+// INPUTS (match Pine defaults exactly)
+//==========================================================================
+
+// MTF Trail
+input int    Inp_MA_Len       = 200;    // MA Length (EMA center for trail)
+input int    Inp_ATR_Len      = 14;     // ATR Length (trail)
+input double Inp_ATR_Mult     = 1.25;   // Trail Distance (ATR multiplier)
+
+// ATM Bot
+input double Inp_A_Buy        = 3.5;    // Buy Sensitivity
+input int    Inp_C_Buy        = 2;      // Buy ATR Period
+input double Inp_A_Sell       = 3.5;    // Sell Sensitivity
+input int    Inp_C_Sell       = 2;      // Sell ATR Period
+
+// Structure
+input int    Inp_SwingSize    = 15;     // Pivot lookback/rightbars
+
+// RSI Momentum
+input int    Inp_RSI_Len      = 14;     // RSI Length
+input int    Inp_RSI_EMA_Len  = 5;      // Momentum EMA Length
+input int    Inp_PMom         = 50;     // Positive momentum threshold
+input int    Inp_NMom         = 50;     // Negative momentum threshold
+input bool   Inp_Sustain      = true;   // Sustain momentum state
+input bool   Inp_UseM5Confirm = true;   // M5 RSI confirmation
+
+// VWAP
+input int    Inp_VWAP_Prd     = 100;    // Swing period for direction
+
+// Fib Bands
+input int    Inp_Fib_Len      = 50;     // Double-EMA length
+
+// Confidence Engine
+input string Inp_ClawMode     = "Moderate"; // Conservative/Moderate/Aggressive
+input double Inp_MTF_W        = 1.5;    // MTF trail weight
+input double Inp_Struct_W     = 1.0;    // Structure weight
+input double Inp_RSI_W        = 1.0;    // RSI weight
+input double Inp_VWAP_W       = 1.0;    // VWAP weight
+input double Inp_Fib_W        = 0.5;    // Fib weight (active if RequireFib)
+input bool   Inp_RequireFib   = false;  // Include Fib factor in score
+input double Inp_VP_W         = 0.5;    // Volume Profile weight (always in denominator — Pine default)
+input bool   Inp_VP_Enabled   = true;   // Include VP weight in max (Pine: vpEnabled=true)
+
+// Risk & Execution (Phase 2+3)
+input double Inp_Risk_Pct      = 1.0;   // Risk per trade (% of balance)
+input double Inp_Risk_USD      = 0.0;   // Fixed risk USD (0 = use % above)
+input double Inp_ScaleIn_Pct   = 0.5;   // Pyramid scale-in risk (% of balance)
+input int    Inp_Max_ScaleIns  = 2;     // Max pyramid additions per trade
+input double Inp_TP2_Trail_ATR = 0.75;  // ATR multiplier for trail tightening after TP2
+input bool   Inp_PyramidOn     = true;  // Enable smart pyramid scale-ins on newSmartBull/Bear
+
+//==========================================================================
+// MODULE 1: GLOBAL STATE
+//==========================================================================
+#define WARMUP_BARS  700
+#define MAGIC_NUMBER 20240623
+#define MAX_TICKETS  12        // 4 primary slices + up to 8 scale-in additions
+
+// MTF Trail states (exec / M5 / M15 / H1)
+int    g_ltf_trend  = 1;  double g_ltf_trail  = 0.0;
+int    g_m5_trend   = 1;  double g_m5_trail   = 0.0;
+int    g_m15_trend  = 1;  double g_m15_trail  = 0.0;
+int    g_h1_trend   = 1;  double g_h1_trail   = 0.0;
+
+// ATM Bot dual trails
+double g_trail_buy  = 0.0;
+double g_trail_sell = 0.0;
+double g_prev_close_atm  = 0.0;  // close[1] for crossover detection
+double g_prev_trail_buy  = 0.0;
+double g_prev_trail_sell = 0.0;
+
+// RSI momentum states (var bool in Pine — persistent)
+bool   g_positive    = false;
+bool   g_negative    = false;
+bool   g_positive_m5 = false;
+bool   g_negative_m5 = false;
+double g_ema5_prev    = 0.0;   // EMA5(close) on exec TF, previous bar
+double g_ema5_m5_prev = 0.0;   // EMA5(close) on M5, previous bar
+double g_rsi_prev     = 0.0;   // RSI on exec TF, previous bar (for p_mom crossing check)
+double g_rsi_m5_prev  = 0.0;   // RSI on M5, previous bar
+bool   g_smart_bull      = false;
+bool   g_smart_bear      = false;
+bool   g_prev_smart_bull = false;
+bool   g_prev_smart_bear = false;
+
+// Structure (SMC)
+double g_prev_high     = 0.0;
+double g_prev_low      = 0.0;
+bool   g_high_active   = false;
+bool   g_low_active    = false;
+int    g_struct_bias   = 0;   // 1 bull, -1 bear, 0 neutral
+
+// Fib Bands (double EMA of HLC3)
+double g_fib_ema1   = 0.0;   // first EMA pass
+double g_fib_ema2   = 0.0;   // basis = EMA(ema1)
+double g_fib_basis_prev = 0.0;
+int    g_trend_fib  = 0;     // 1 bull, -1 bear
+
+// VWAP direction
+long   g_vwap_phL   = 0;     // bar index of most recent highest high (prd bars)
+long   g_vwap_plL   = 0;     // bar index of most recent lowest  low  (prd bars)
+int    g_last_swing = 0;     // 1 bull, -1 bear (updates only on dir change)
+int    g_dir_vwap   = 0;     // current VWAP direction
+int    g_prev_dir_vwap = 0;  // for detecting direction change
+long   g_bar_count  = 0;     // running bar index (mimics Pine's bar_index)
+
+// MTF bar-change detection
+datetime g_last_bar_time  = 0;
+datetime g_last_m5_time   = 0;
+datetime g_last_m15_time  = 0;
+datetime g_last_h1_time   = 0;
+
+// Indicator handles
+int g_h_ema_exec  = INVALID_HANDLE;  // EMA(200) exec TF — for calcLiqTrail
+int g_h_atr_exec  = INVALID_HANDLE;  // ATR(14)  exec TF
+int g_h_ema_m5    = INVALID_HANDLE;
+int g_h_atr_m5    = INVALID_HANDLE;
+int g_h_ema_m15   = INVALID_HANDLE;
+int g_h_atr_m15   = INVALID_HANDLE;
+int g_h_ema_h1    = INVALID_HANDLE;
+int g_h_atr_h1    = INVALID_HANDLE;
+int g_h_atr_atm_buy  = INVALID_HANDLE;  // ATR(c_buy)  exec TF — ATM Bot buy trail
+int g_h_atr_atm_sell = INVALID_HANDLE;  // ATR(c_sell) exec TF — ATM Bot sell trail
+int g_h_rsi_exec  = INVALID_HANDLE;  // RSI(14) exec TF
+int g_h_rsi_m5    = INVALID_HANDLE;  // RSI(14) M5 TF
+int g_h_ema5_exec = INVALID_HANDLE;  // EMA(5) exec TF — change_ema5
+int g_h_ema5_m5   = INVALID_HANDLE;  // EMA(5) M5   TF
+
+// Trade state (Phase 2+3)
+int    g_trade_dir      = 0;    // 1=long, -1=short, 0=flat
+int    g_trade_phase    = 0;    // 0=none 1=entry 2=tp1hit 3=tp2hit 4=runner
+double g_entry_price    = 0.0;
+double g_sl_price       = 0.0;
+double g_sl_dist        = 0.0;  // initial risk distance (1R)
+double g_tp1_price      = 0.0;
+double g_tp2_price      = 0.0;
+double g_tp3_price      = 0.0;
+ulong  g_tickets[MAX_TICKETS];
+int    g_ticket_count   = 0;    // filled ticket slots
+int    g_scale_in_count = 0;
+
+//==========================================================================
+// MODULE 2 HELPERS: calcLiqTrail (EMA-centered — exact Pine formula)
+//==========================================================================
+
+// Single-step update of a trail ratchet.
+// Pine: raw_up = EMA(close,mlen) - ATR(alen)*amult  (floor)
+//       raw_dn = EMA(close,mlen) + ATR(alen)*amult  (ceiling)
+void StepLiqTrail(double ema_val, double atr_val, double amult, double close_val,
+                  int &trend, double &trail)
+{
+   double raw_up = ema_val - atr_val * amult;
+   double raw_dn = ema_val + atr_val * amult;
+   if(trend == 1) {
+      double new_t = MathMax(raw_up, trail);
+      if(close_val < new_t) { trend = -1; trail = raw_dn; }
+      else                   { trail = new_t; }
+   } else {
+      double new_t = MathMin(raw_dn, trail);
+      if(close_val > new_t) { trend = 1; trail = raw_up; }
+      else                   { trail = new_t; }
+   }
+}
+
+// Warm up trail state by replaying WARMUP_BARS of history.
+// ema_arr and atr_arr must be oldest-first (index 0 = oldest bar).
+void WarmupLiqTrail(const double &ema_arr[], const double &atr_arr[],
+                    const double &close_arr[], double amult,
+                    int &out_trend, double &out_trail)
+{
+   int n = MathMin(ArraySize(ema_arr), MathMin(ArraySize(atr_arr), ArraySize(close_arr)));
+   if(n < 2) { out_trend = 1; out_trail = close_arr[n > 0 ? 0 : 0]; return; }
+   // Pine barstate.isfirst: init based on whether close is above EMA
+   double e0 = ema_arr[0], c0 = close_arr[0], a0 = atr_arr[0];
+   int  trend = c0 > e0 ? 1 : -1;
+   double trail = trend == 1 ? e0 - a0 * amult : e0 + a0 * amult;
+   for(int i = 1; i < n; i++)
+      StepLiqTrail(ema_arr[i], atr_arr[i], amult, close_arr[i], trend, trail);
+   out_trend = trend;
+   out_trail = trail;
+}
+
+// Copy indicator buffer and CopyClose for a given TF, reverse to oldest-first.
+bool CopyTFHistory(ENUM_TIMEFRAMES tf, int h_ema, int h_atr, int bars,
+                   double &ema_out[], double &atr_out[], double &close_out[])
+{
+   int copied;
+   copied = CopyBuffer(h_ema, 0, 0, bars, ema_out);   if(copied < bars) return false;
+   copied = CopyBuffer(h_atr, 0, 0, bars, atr_out);   if(copied < bars) return false;
+   copied = CopyClose(_Symbol, tf, 0, bars, close_out); if(copied < bars) return false;
+   ArrayReverse(ema_out);
+   ArrayReverse(atr_out);
+   ArrayReverse(close_out);
+   return true;
+}
+
+//==========================================================================
+// MODULE 3 HELPERS: ATM Bot trail update (exact Pine ratchet)
+//==========================================================================
+
+// Pine ratchet for trail_buy / trail_sell — identical logic, different init.
+// Both use: close as src, ATR(c_buy/c_sell) as band, a_buy/a_sell as multiplier.
+void StepATMTrail(double close_curr, double close_prev,
+                  double nLoss, double &trail)
+{
+   if(close_curr > trail && close_prev > trail)
+      trail = MathMax(trail, close_curr - nLoss);
+   else if(close_curr < trail && close_prev < trail)
+      trail = MathMin(trail, close_curr + nLoss);
+   else
+      trail = close_curr > trail ? close_curr - nLoss : close_curr + nLoss;
+}
+
+
+//==========================================================================
+// MODULE 4 HELPERS: RSI Momentum (replay for warmup)
+//==========================================================================
+
+// Replay Pine's var bool positive / negative state machine from arrays.
+// rsi_arr and ema5_arr must be oldest-first.
+void WarmupRSIState(const double &rsi_arr[], const double &ema5_arr[],
+                    int pmom, int nmom, bool sustain,
+                    bool &out_pos, bool &out_neg, double &out_ema5_prev)
+{
+   int n = MathMin(ArraySize(rsi_arr), ArraySize(ema5_arr));
+   if(n < 2) { out_pos = false; out_neg = false; out_ema5_prev = 0; return; }
+   bool pos = false, neg = false;
+   for(int i = 1; i < n; i++) {
+      double rsi       = rsi_arr[i];
+      double ema5      = ema5_arr[i];
+      double ema5_prev = ema5_arr[i - 1];
+      double ch_ema5   = ema5 - ema5_prev;
+      bool p_mom    = rsi_arr[i-1] < pmom && rsi > pmom && rsi > nmom && ch_ema5 > 0;
+      bool n_mom    = rsi < nmom && ch_ema5 < 0;
+      bool p_sust   = sustain && pos && rsi > pmom && ch_ema5 > 0;
+      bool n_sust   = sustain && neg && rsi < nmom && ch_ema5 < 0;
+      if(p_mom || p_sust) { pos = true;  neg = false; }
+      if(n_mom || n_sust) { pos = false; neg = true;  }
+   }
+   out_pos = pos;
+   out_neg = neg;
+   out_ema5_prev = ema5_arr[n - 1];
+}
+
+//==========================================================================
+// MODULE 5 HELPERS: Structure (pivot detection for BOS/CHoCH)
+//==========================================================================
+
+// Returns the pivot high value if bar at shift `right` is a pivot high
+// (highest high in [right+left .. right-left] window), 0 otherwise.
+// Requires: highs[0] = most recent bar (series-order).
+double PivotHigh(const double &h[], int left, int right)
+{
+   int total = ArraySize(h);
+   if(total < left + right + 1) return 0.0;
+   double pval = h[right];
+   if(pval == 0.0) return 0.0;
+   for(int i = 0; i <= left + right; i++) {
+      if(i == right) continue;
+      if(h[i] >= pval) return 0.0;
+   }
+   return pval;
+}
+
+double PivotLow(const double &l[], int left, int right)
+{
+   int total = ArraySize(l);
+   if(total < left + right + 1) return 0.0;
+   double pval = l[right];
+   if(pval == 0.0) return 0.0;
+   for(int i = 0; i <= left + right; i++) {
+      if(i == right) continue;
+      if(l[i] <= pval) return 0.0;
+   }
+   return pval;
+}
+
+// Process one structure update from fresh price arrays (series order: 0=newest).
+// Updates g_prev_high, g_prev_low, g_high_active, g_low_active, g_struct_bias.
+// Returns bullBOS or bearBOS flag via out params.
+void UpdateStructure(const double &h[], const double &l[], const double &c_arr[],
+                     bool &out_bull_bos, bool &out_bear_bos)
+{
+   out_bull_bos = false;
+   out_bear_bos = false;
+   int sw = Inp_SwingSize;
+   double ph = PivotHigh(h, sw, sw);
+   double pl = PivotLow(l, sw, sw);
+
+   if(ph > 0.0) {
+      if(g_prev_high == 0.0 || ph >= g_prev_high) {
+         g_struct_bias = 1;
+      } else {
+         g_struct_bias = -1;
+      }
+      g_prev_high   = ph;
+      g_high_active = true;
+   }
+   if(pl > 0.0) {
+      if(g_prev_low == 0.0 || pl >= g_prev_low) {
+         if(g_struct_bias != -1) g_struct_bias = 1;
+      } else {
+         g_struct_bias = -1;
+      }
+      g_prev_low   = pl;
+      g_low_active = true;
+   }
+
+   // BOS: close breaks through the stored prev level
+   double close_now = c_arr[0];
+   if(g_high_active && g_prev_high > 0.0 && close_now > g_prev_high) {
+      if(g_struct_bias == 1) out_bull_bos = true;
+      g_high_active = false;
+   }
+   if(g_low_active && g_prev_low > 0.0 && close_now < g_prev_low) {
+      if(g_struct_bias == -1) out_bear_bos = true;
+      g_low_active = false;
+   }
+}
+
+//==========================================================================
+// MODULE 6 HELPERS: Fib Bands (double EMA of HLC3)
+//==========================================================================
+
+// Incremental EMA update: alpha = 2/(period+1)
+double StepEMA(double prev, double val, int period)
+{
+   double k = 2.0 / (period + 1);
+   return val * k + prev * (1.0 - k);
+}
+
+// Warm up double EMA of HLC3 from oldest-first hlc3 array.
+void WarmupFibEMA(const double &hlc3_arr[], int len,
+                  double &out_ema1, double &out_ema2, double &out_basis_prev, int &out_trend)
+{
+   int n = ArraySize(hlc3_arr);
+   if(n < 1) return;
+   double ema1 = hlc3_arr[0];
+   double ema2 = hlc3_arr[0];
+   double basis_prev = ema2;
+   int trend = 0;
+   for(int i = 1; i < n; i++) {
+      ema1 = StepEMA(ema1, hlc3_arr[i], len);
+      ema2 = StepEMA(ema2, ema1, len);
+      if(ema2 > basis_prev) trend = 1;
+      else if(ema2 < basis_prev) trend = -1;
+      basis_prev = ema2;
+   }
+   out_ema1       = ema1;
+   out_ema2       = ema2;
+   out_basis_prev = basis_prev;
+   out_trend      = trend;
+}
+
+//==========================================================================
+// MODULE 7 HELPERS: VWAP Direction
+//==========================================================================
+
+// Returns VWAP direction: compare bar index of most recent highest high
+// vs most recent lowest low in last prd bars.
+// dir = vw_phL > vw_plL ? 1 : -1   (more-recent pivot wins)
+// lastSwing updates only when direction changes.
+// NOTE: uses shift=1 so we evaluate on the last CONFIRMED bar (matches Pine
+// semantics: ta.highestbars evaluates at confirmed bar close, not on forming bar).
+void UpdateVWAPDirection(long current_bar_idx)
+{
+   // shift=1: start search from last confirmed bar, not forming bar.
+   // hb/lb == 0 means the bar at shift=1 (last confirmed) has the extreme.
+   int hb = (int)iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, Inp_VWAP_Prd, 1);
+   int lb = (int)iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  Inp_VWAP_Prd, 1);
+   if(hb == 0) g_vwap_phL = current_bar_idx;
+   if(lb == 0) g_vwap_plL = current_bar_idx;
+
+   int dir = g_vwap_phL > g_vwap_plL ? 1 : -1;
+   if(dir != g_prev_dir_vwap && g_prev_dir_vwap != 0) {
+      g_last_swing = dir;
+   } else if(g_prev_dir_vwap == 0) {
+      g_last_swing = dir;
+   }
+   g_dir_vwap      = dir;
+   g_prev_dir_vwap = dir;
+}
+
+//==========================================================================
+// MODULE 11-13: PLATINUM RISK MODEL + ORDERSEND EXECUTION
+//==========================================================================
+
+// Risk-based lot size using symbol tick value (works for all Deriv instruments).
+double CalcLotSize(double entry, double sl, double risk_pct)
+{
+   double balance      = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_usd     = Inp_Risk_USD > 0.0 ? Inp_Risk_USD : balance * risk_pct / 100.0;
+   double sl_dist      = MathAbs(entry - sl);
+   if(sl_dist <= 0.0) return 0.0;
+   double tick_val     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick_val <= 0.0 || tick_size <= 0.0) return 0.0;
+   double risk_per_lot = (sl_dist / tick_size) * tick_val;
+   if(risk_per_lot <= 0.0) return 0.0;
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lots     = MathFloor((risk_usd / risk_per_lot) / lot_step) * lot_step;
+   return MathMax(min_lot, MathMin(max_lot, lots));
+}
+
+// Platinum Risk Model — derive SL from liquidity target.
+// Long:  BSL = g_prev_high.  sl_for_2rr = entry - (BSL-entry)/2.
+//         sl = MathMin(sl_for_2rr, ltf_trail)  →  widest coverage below entry.
+// Short: SSL = g_prev_low.   sl_for_2rr = entry + (entry-SSL)/2.
+//         sl = MathMax(sl_for_2rr, ltf_trail)  →  widest coverage above entry.
+// Falls back to ltf_trail when structure target is unavailable or invalid.
+double CalcPlatinumSL(int dir, double entry)
+{
+   if(dir > 0) {
+      double target = g_prev_high;
+      if(target > 0.0 && target > entry) {
+         double sl_for_2rr = entry - (target - entry) / 2.0;
+         return MathMin(sl_for_2rr, g_ltf_trail);
+      }
+      return g_ltf_trail;  // fallback
+   } else {
+      double target = g_prev_low;
+      if(target > 0.0 && target < entry) {
+         double sl_for_2rr = entry + (entry - target) / 2.0;
+         return MathMax(sl_for_2rr, g_ltf_trail);
+      }
+      return g_ltf_trail;  // fallback
+   }
+}
+
+// Modify SL on an open position. No-ops if position gone or change is sub-tick.
+bool ModifyPositionSL(ulong ticket, double new_sl)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   int    digits   = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double tick_sz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   new_sl = NormalizeDouble(new_sl, digits);
+   if(MathAbs(PositionGetDouble(POSITION_SL) - new_sl) < tick_sz) return true;
+   MqlTradeRequest req = {}; MqlTradeResult res = {};
+   req.action   = TRADE_ACTION_SLTP;
+   req.position = ticket;
+   req.symbol   = PositionGetString(POSITION_SYMBOL);
+   req.sl       = new_sl;
+   req.tp       = PositionGetDouble(POSITION_TP);
+   if(!OrderSend(req, res))
+      Print("[CLAW] ModifySL failed ticket=", ticket, " retcode=", res.retcode);
+   return res.retcode == TRADE_RETCODE_DONE;
+}
+
+// Close a position at market.
+bool ClosePosition(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   MqlTradeRequest req = {}; MqlTradeResult res = {};
+   req.action       = TRADE_ACTION_DEAL;
+   req.position     = ticket;
+   req.symbol       = PositionGetString(POSITION_SYMBOL);
+   req.volume       = PositionGetDouble(POSITION_VOLUME);
+   req.type         = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY
+                      ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   req.price        = req.type == ORDER_TYPE_SELL
+                      ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                      : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   req.type_filling = ORDER_FILLING_RETURN;
+   req.magic        = MAGIC_NUMBER;
+   if(!OrderSend(req, res))
+      Print("[CLAW] ClosePosition failed ticket=", ticket, " retcode=", res.retcode);
+   return res.retcode == TRADE_RETCODE_DONE;
+}
+
+// Open 4 equal-risk slices: Slice1→TP1 Slice2→TP2 Slice3→TP3 Runner→no TP.
+// sl_price already calculated by CalcPlatinumSL. Entry price from live ASK/BID.
+bool OpenTrade(int dir, double sl_price)
+{
+   int    digits    = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double entry     = NormalizeDouble(dir > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                              : SymbolInfoDouble(_Symbol, SYMBOL_BID), digits);
+   sl_price         = NormalizeDouble(sl_price, digits);
+   double sl_d      = MathAbs(entry - sl_price);
+   if(sl_d <= 0.0) { Print("[CLAW] OpenTrade: zero SL dist"); return false; }
+
+   // SL must be on the right side
+   if(dir > 0 && sl_price >= entry) { Print("[CLAW] OpenTrade: long SL above entry"); return false; }
+   if(dir < 0 && sl_price <= entry) { Print("[CLAW] OpenTrade: short SL below entry"); return false; }
+
+   double tp1 = NormalizeDouble(dir > 0 ? entry + sl_d       : entry - sl_d,       digits);
+   double tp2 = NormalizeDouble(dir > 0 ? entry + sl_d * 2.0 : entry - sl_d * 2.0, digits);
+   double tp3 = NormalizeDouble(dir > 0 ? entry + sl_d * 3.0 : entry - sl_d * 3.0, digits);
+
+   double total_lots = CalcLotSize(entry, sl_price, Inp_Risk_Pct);
+   double lot_step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double min_lot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double slice      = MathMax(min_lot, MathFloor((total_lots / 4.0) / lot_step) * lot_step);
+
+   if(slice < min_lot) {
+      Print("[CLAW] OpenTrade: slice lots ", slice, " < min ", min_lot, " — risk too small");
+      return false;
+   }
+
+   ENUM_ORDER_TYPE ot = dir > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   string   cms[4]  = {"CLAW_S1", "CLAW_S2", "CLAW_S3", "CLAW_RUN"};
+   double   tps[4]  = {tp1, tp2, tp3, 0.0};  // Runner has no TP
+
+   g_ticket_count  = 0;
+   g_scale_in_count = 0;
+   ArrayInitialize(g_tickets, 0);
+
+   int opened = 0;
+   for(int i = 0; i < 4; i++) {
+      MqlTradeRequest req = {}; MqlTradeResult res = {};
+      req.action       = TRADE_ACTION_DEAL;
+      req.symbol       = _Symbol;
+      req.type         = ot;
+      req.volume       = slice;
+      req.price        = entry;
+      req.sl           = sl_price;
+      req.tp           = tps[i];
+      req.type_filling = ORDER_FILLING_RETURN;
+      req.magic        = MAGIC_NUMBER;
+      req.comment      = cms[i];
+      if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE) {
+         g_tickets[g_ticket_count++] = res.order;
+         opened++;
+      } else {
+         Print("[CLAW] OrderSend slice ", i, " FAILED retcode=", res.retcode,
+               " comment=", res.comment);
+      }
+   }
+
+   if(opened > 0) {
+      g_trade_dir    = dir;
+      g_trade_phase  = 1;
+      g_entry_price  = entry;
+      g_sl_price     = sl_price;
+      g_sl_dist      = sl_d;
+      g_tp1_price    = tp1;
+      g_tp2_price    = tp2;
+      g_tp3_price    = tp3;
+      Print("[CLAW ENTRY] dir=", dir > 0 ? "LONG" : "SHORT",
+            " entry=", DoubleToString(entry, digits),
+            " sl=", DoubleToString(sl_price, digits),
+            " R=", DoubleToString(sl_d, digits),
+            " TP1=", DoubleToString(tp1, digits),
+            " TP2=", DoubleToString(tp2, digits),
+            " TP3=", DoubleToString(tp3, digits),
+            " lots/slice=", DoubleToString(slice, 2),
+            " opened=", opened, "/4");
+      return true;
+   }
+   return false;
+}
+
+// Add a pyramid position. Uses ltf_trail as SL, runner-style exit (no TP).
+bool OpenScaleIn(int dir)
+{
+   if(!Inp_PyramidOn || g_scale_in_count >= Inp_Max_ScaleIns) return false;
+   if(g_ticket_count >= MAX_TICKETS) return false;
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double entry  = NormalizeDouble(dir > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                           : SymbolInfoDouble(_Symbol, SYMBOL_BID), digits);
+   double sl     = NormalizeDouble(g_ltf_trail, digits);
+   if(MathAbs(entry - sl) <= 0.0) return false;
+   if(dir > 0 && sl >= entry) return false;
+   if(dir < 0 && sl <= entry) return false;
+   double lots = CalcLotSize(entry, sl, Inp_ScaleIn_Pct);
+   if(lots <= 0.0) return false;
+
+   MqlTradeRequest req = {}; MqlTradeResult res = {};
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = _Symbol;
+   req.type         = dir > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.volume       = lots;
+   req.price        = entry;
+   req.sl           = sl;
+   req.tp           = 0.0;
+   req.type_filling = ORDER_FILLING_RETURN;
+   req.magic        = MAGIC_NUMBER;
+   req.comment      = "CLAW_SC" + IntegerToString(g_scale_in_count + 1);
+   if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE) {
+      g_tickets[g_ticket_count++] = res.order;
+      g_scale_in_count++;
+      Print("[CLAW SCALE-IN #", g_scale_in_count, "]",
+            " dir=", dir > 0 ? "LONG" : "SHORT",
+            " entry=", DoubleToString(entry, digits),
+            " sl=ltf_trail=", DoubleToString(sl, digits),
+            " lots=", DoubleToString(lots, 2));
+      return true;
+   }
+   Print("[CLAW] Scale-in FAILED retcode=", res.retcode);
+   return false;
+}
+
+// Position exit + SL management — runs every tick.
+// Phase state machine:
+//   1 = all 4 slices open
+//   2 = TP1 hit → SLs moved to BE (entry)
+//   3 = TP2 hit → trail tightens to price ∓ ATR×TP2_Trail_ATR
+//   4 = TP3 hit → runner only, trail = ltf_trail (flip = exit)
+void ManageOpenTrade()
+{
+   if(g_trade_dir == 0 || g_trade_phase == 0) return;
+
+   // Determine which primary slices are still alive
+   bool s[4];
+   for(int i = 0; i < 4; i++)
+      s[i] = g_ticket_count > i && PositionSelectByTicket(g_tickets[i]);
+
+   bool any_open = s[0] || s[1] || s[2] || s[3];
+   if(!any_open) {
+      // Check scale-ins
+      for(int i = 4; i < g_ticket_count && !any_open; i++)
+         if(PositionSelectByTicket(g_tickets[i])) { any_open = true; break; }
+   }
+   if(!any_open) {
+      Print("[CLAW] All positions closed. Phase=", g_trade_phase, " Resetting.");
+      g_trade_dir = 0; g_trade_phase = 0;
+      g_ticket_count = 0; g_scale_in_count = 0;
+      return;
+   }
+
+   // Phase 1 → 2: Slice 1 gone (TP1 hit or manual close) but others alive
+   if(g_trade_phase == 1 && !s[0] && (s[1] || s[2] || s[3])) {
+      g_trade_phase = 2;
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      Print("[CLAW] TP1 HIT — moving all SLs to BE: ", DoubleToString(g_entry_price, digits));
+      for(int i = 1; i < g_ticket_count; i++)
+         ModifyPositionSL(g_tickets[i], g_entry_price);
+   }
+
+   // Phase 2 → 3: Slice 2 gone (TP2 hit)
+   if(g_trade_phase == 2 && !s[1] && (s[2] || s[3])) {
+      g_trade_phase = 3;
+      Print("[CLAW] TP2 HIT — tightening trail to price ± ATR×", Inp_TP2_Trail_ATR);
+   }
+
+   // Phase 3 → 4: Slice 3 gone (TP3 hit)
+   if(g_trade_phase == 3 && !s[2] && s[3]) {
+      g_trade_phase = 4;
+      Print("[CLAW] TP3 HIT — Runner mode. Trail=ltf_trail");
+   }
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Phase 3: tighten trail to current price ∓ ATR×0.75 each tick.
+   // Ratchet-only: SL only moves in favorable direction (never back against trade).
+   if(g_trade_phase == 3) {
+      double atr_buf[1];
+      if(CopyBuffer(g_h_atr_exec, 0, 1, 1, atr_buf) == 1) {
+         double raw_sl;
+         if(g_trade_dir > 0)
+            raw_sl = bid - atr_buf[0] * Inp_TP2_Trail_ATR;
+         else
+            raw_sl = ask + atr_buf[0] * Inp_TP2_Trail_ATR;
+         for(int i = 2; i < g_ticket_count; i++) {
+            if(!PositionSelectByTicket(g_tickets[i])) continue;
+            double cur_sl = PositionGetDouble(POSITION_SL);
+            // Ratchet: long → only move SL up. Short → only move SL down.
+            double trail_sl = g_trade_dir > 0
+                              ? MathMax(MathMax(g_entry_price, cur_sl), raw_sl)
+                              : MathMin(MathMin(g_entry_price, cur_sl), raw_sl);
+            ModifyPositionSL(g_tickets[i], trail_sl);
+         }
+      }
+   }
+
+   // Phase 4: Runner — SL tracks ltf_trail bar-by-bar.
+   // Exit if trend flips (trail crosses price — EA signals reversal).
+   if(g_trade_phase == 4) {
+      if(s[3]) ModifyPositionSL(g_tickets[3], g_ltf_trail);
+      // Also update any scale-in runners
+      for(int i = 4; i < g_ticket_count; i++)
+         if(PositionSelectByTicket(g_tickets[i]))
+            ModifyPositionSL(g_tickets[i], g_ltf_trail);
+      // Trend flip = time to exit runner (trail already manages the actual close,
+      // but we can force-close if needed in edge cases where broker SL fails)
+      bool flip = (g_trade_dir > 0 && g_ltf_trend == -1) ||
+                  (g_trade_dir < 0 && g_ltf_trend ==  1);
+      if(flip) {
+         Print("[CLAW] Runner: ltf_trail flipped — closing runner + scale-ins.");
+         if(s[3]) ClosePosition(g_tickets[3]);
+         for(int i = 4; i < g_ticket_count; i++)
+            if(PositionSelectByTicket(g_tickets[i])) ClosePosition(g_tickets[i]);
+      }
+   }
+}
+
+//==========================================================================
+// MODULE 9 HELPERS: Confidence Engine
+//==========================================================================
+
+int ConfidenceThreshold()
+{
+   if(Inp_ClawMode == "Conservative") return 80;
+   if(Inp_ClawMode == "Aggressive")   return 40;
+   return 60; // Moderate (default)
+}
+
+// vp_bull: true when close > VAL (volume profile bullish confirmation).
+// Phase 1: caller passes vp_bull=true (permissive) until VP is implemented.
+double ComputeConfidence(bool mtf_full, bool mtf_partial, bool struct_bull,
+                         bool rsi_bull, bool vwap_bull, bool fib_bull, bool vp_bull)
+{
+   double score = 0.0, max_w = 0.0;
+   // MTF (full = both M15+H1, partial = one of them)
+   score += mtf_full ? Inp_MTF_W : (mtf_partial ? Inp_MTF_W * 0.4 : 0.0);
+   max_w += Inp_MTF_W;
+   // Structure
+   score += struct_bull ? Inp_Struct_W : 0.0;
+   max_w += Inp_Struct_W;
+   // RSI
+   score += rsi_bull ? Inp_RSI_W : 0.0;
+   max_w += Inp_RSI_W;
+   // VWAP
+   score += vwap_bull ? Inp_VWAP_W : 0.0;
+   max_w += Inp_VWAP_W;
+   // Fib (optional — Pine: requireFibTrend input, default false)
+   if(Inp_RequireFib) {
+      score += fib_bull ? Inp_Fib_W : 0.0;
+      max_w += Inp_Fib_W;
+   }
+   // Volume Profile — Pine always includes when vpEnabled=true (default).
+   // Phase 1: vp_bull passed as true (permissive) until VP engine is built.
+   if(Inp_VP_Enabled) {
+      score += vp_bull ? Inp_VP_W : 0.0;
+      max_w += Inp_VP_W;
+   }
+   return max_w > 0.0 ? (score / max_w) * 100.0 : 0.0;
+}
+
+//==========================================================================
+// OnInit
+//==========================================================================
+int OnInit()
+{
+   // Create all indicator handles
+   g_h_ema_exec  = iMA(_Symbol, PERIOD_CURRENT, Inp_MA_Len, 0, MODE_EMA, PRICE_CLOSE);
+   g_h_atr_exec  = iATR(_Symbol, PERIOD_CURRENT, Inp_ATR_Len);
+   g_h_ema_m5    = iMA(_Symbol, PERIOD_M5,  Inp_MA_Len, 0, MODE_EMA, PRICE_CLOSE);
+   g_h_atr_m5    = iATR(_Symbol, PERIOD_M5,  Inp_ATR_Len);
+   g_h_ema_m15   = iMA(_Symbol, PERIOD_M15, Inp_MA_Len, 0, MODE_EMA, PRICE_CLOSE);
+   g_h_atr_m15   = iATR(_Symbol, PERIOD_M15, Inp_ATR_Len);
+   g_h_ema_h1    = iMA(_Symbol, PERIOD_H1,  Inp_MA_Len, 0, MODE_EMA, PRICE_CLOSE);
+   g_h_atr_h1    = iATR(_Symbol, PERIOD_H1,  Inp_ATR_Len);
+   g_h_atr_atm_buy  = iATR(_Symbol, PERIOD_CURRENT, Inp_C_Buy);
+   g_h_atr_atm_sell = iATR(_Symbol, PERIOD_CURRENT, Inp_C_Sell);
+   g_h_rsi_exec  = iRSI(_Symbol, PERIOD_CURRENT, Inp_RSI_Len, PRICE_CLOSE);
+   g_h_rsi_m5    = iRSI(_Symbol, PERIOD_M5,  Inp_RSI_Len, PRICE_CLOSE);
+   g_h_ema5_exec = iMA(_Symbol, PERIOD_CURRENT, Inp_RSI_EMA_Len, 0, MODE_EMA, PRICE_CLOSE);
+   g_h_ema5_m5   = iMA(_Symbol, PERIOD_M5,  Inp_RSI_EMA_Len, 0, MODE_EMA, PRICE_CLOSE);
+
+   // Validate handles
+   if(g_h_ema_exec      == INVALID_HANDLE || g_h_atr_exec  == INVALID_HANDLE ||
+      g_h_ema_m5        == INVALID_HANDLE || g_h_atr_m5    == INVALID_HANDLE ||
+      g_h_ema_m15       == INVALID_HANDLE || g_h_atr_m15   == INVALID_HANDLE ||
+      g_h_ema_h1        == INVALID_HANDLE || g_h_atr_h1    == INVALID_HANDLE ||
+      g_h_atr_atm_buy   == INVALID_HANDLE || g_h_atr_atm_sell == INVALID_HANDLE ||
+      g_h_rsi_exec      == INVALID_HANDLE || g_h_rsi_m5    == INVALID_HANDLE ||
+      g_h_ema5_exec     == INVALID_HANDLE || g_h_ema5_m5   == INVALID_HANDLE)
+   {
+      Print("[CLAW] ERROR: Failed to create indicator handles.");
+      return INIT_FAILED;
+   }
+
+   // Wait for indicator data to be available
+   int retries = 200;
+   while(retries-- > 0 && (
+         BarsCalculated(g_h_ema_exec) < WARMUP_BARS ||
+         BarsCalculated(g_h_ema_m15)  < 200 ||
+         BarsCalculated(g_h_ema_h1)   < 100))
+      Sleep(100);
+
+   // --- Warmup exec TF calcLiqTrail ---
+   {
+      double ema_a[], atr_a[], cl_a[];
+      if(CopyTFHistory(PERIOD_CURRENT, g_h_ema_exec, g_h_atr_exec, WARMUP_BARS, ema_a, atr_a, cl_a))
+         WarmupLiqTrail(ema_a, atr_a, cl_a, Inp_ATR_Mult, g_ltf_trend, g_ltf_trail);
+      else Print("[CLAW] WARN: Exec TF trail warmup incomplete.");
+   }
+   // --- Warmup M5 ---
+   {
+      double ema_a[], atr_a[], cl_a[];
+      int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_ema_m5));
+      if(bars >= 50 && CopyTFHistory(PERIOD_M5, g_h_ema_m5, g_h_atr_m5, bars, ema_a, atr_a, cl_a))
+         WarmupLiqTrail(ema_a, atr_a, cl_a, Inp_ATR_Mult, g_m5_trend, g_m5_trail);
+   }
+   // --- Warmup M15 ---
+   {
+      double ema_a[], atr_a[], cl_a[];
+      int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_ema_m15));
+      if(bars >= 50 && CopyTFHistory(PERIOD_M15, g_h_ema_m15, g_h_atr_m15, bars, ema_a, atr_a, cl_a))
+         WarmupLiqTrail(ema_a, atr_a, cl_a, Inp_ATR_Mult, g_m15_trend, g_m15_trail);
+   }
+   // --- Warmup H1 ---
+   {
+      double ema_a[], atr_a[], cl_a[];
+      int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_ema_h1));
+      if(bars >= 50 && CopyTFHistory(PERIOD_H1, g_h_ema_h1, g_h_atr_h1, bars, ema_a, atr_a, cl_a))
+         WarmupLiqTrail(ema_a, atr_a, cl_a, Inp_ATR_Mult, g_h1_trend, g_h1_trail);
+   }
+
+   // --- Warmup ATM Bot trails (uses confirmed bars only: shift=1) ---
+   {
+      double cl_a[], atr_buy_a[], atr_sell_a[];
+      int bars = MathMin(WARMUP_BARS, MathMin(BarsCalculated(g_h_atr_atm_buy),
+                                              BarsCalculated(g_h_atr_atm_sell)));
+      if(bars >= 10) {
+         CopyClose(_Symbol, PERIOD_CURRENT, 1, bars, cl_a);
+         CopyBuffer(g_h_atr_atm_buy,  0, 1, bars, atr_buy_a);
+         CopyBuffer(g_h_atr_atm_sell, 0, 1, bars, atr_sell_a);
+         ArrayReverse(cl_a); ArrayReverse(atr_buy_a); ArrayReverse(atr_sell_a);
+         // Warmup with separate buy/sell ATR arrays
+         int n = MathMin(ArraySize(cl_a), MathMin(ArraySize(atr_buy_a), ArraySize(atr_sell_a)));
+         if(n >= 1) {
+            g_trail_buy  = cl_a[0] - Inp_A_Buy  * atr_buy_a[0];
+            g_trail_sell = cl_a[0] + Inp_A_Sell * atr_sell_a[0];
+            for(int i = 1; i < n; i++) {
+               double c = cl_a[i], cp = cl_a[i - 1];
+               StepATMTrail(c, cp, Inp_A_Buy  * atr_buy_a[i],  g_trail_buy);
+               StepATMTrail(c, cp, Inp_A_Sell * atr_sell_a[i], g_trail_sell);
+            }
+            g_prev_close_atm  = cl_a[n - 1];
+            g_prev_trail_buy  = g_trail_buy;
+            g_prev_trail_sell = g_trail_sell;
+         }
+      }
+   }
+
+   // --- Warmup RSI state (confirmed bars: shift=1) ---
+   {
+      double rsi_a[], ema5_a[];
+      int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_rsi_exec));
+      if(bars >= 20) {
+         CopyBuffer(g_h_rsi_exec,  0, 1, bars, rsi_a);
+         CopyBuffer(g_h_ema5_exec, 0, 1, bars, ema5_a);
+         ArrayReverse(rsi_a); ArrayReverse(ema5_a);
+         WarmupRSIState(rsi_a, ema5_a, Inp_PMom, Inp_NMom, Inp_Sustain,
+                        g_positive, g_negative, g_ema5_prev);
+         // Seed previous-RSI for crossing check in OnTick
+         g_rsi_prev = (ArraySize(rsi_a) >= 2) ? rsi_a[ArraySize(rsi_a) - 2] : 0.0;
+      }
+   }
+   // --- Warmup M5 RSI state (confirmed bars: shift=1) ---
+   {
+      double rsi_a[], ema5_a[];
+      int bars = MathMin(WARMUP_BARS, BarsCalculated(g_h_rsi_m5));
+      if(bars >= 20) {
+         CopyBuffer(g_h_rsi_m5,  0, 1, bars, rsi_a);
+         CopyBuffer(g_h_ema5_m5, 0, 1, bars, ema5_a);
+         ArrayReverse(rsi_a); ArrayReverse(ema5_a);
+         WarmupRSIState(rsi_a, ema5_a, Inp_PMom, Inp_NMom, Inp_Sustain,
+                        g_positive_m5, g_negative_m5, g_ema5_m5_prev);
+         g_rsi_m5_prev = (ArraySize(rsi_a) >= 2) ? rsi_a[ArraySize(rsi_a) - 2] : 0.0;
+      }
+   }
+
+   // --- Warmup Fib Bands (double EMA of HLC3 on exec TF) ---
+   {
+      double h[], l[], c[];
+      int bars = MathMin(WARMUP_BARS, Bars(_Symbol, PERIOD_CURRENT));
+      if(bars >= Inp_Fib_Len * 3) {
+         CopyHigh( _Symbol, PERIOD_CURRENT, 0, bars, h);
+         CopyLow(  _Symbol, PERIOD_CURRENT, 0, bars, l);
+         CopyClose(_Symbol, PERIOD_CURRENT, 0, bars, c);
+         // Build oldest-first HLC3 array
+         double hlc3[];
+         ArrayResize(hlc3, bars);
+         for(int i = 0; i < bars; i++)
+            hlc3[bars - 1 - i] = (h[i] + l[i] + c[i]) / 3.0;
+         WarmupFibEMA(hlc3, Inp_Fib_Len, g_fib_ema1, g_fib_ema2, g_fib_basis_prev, g_trend_fib);
+      }
+   }
+
+   // --- Warmup Structure bias from recent pivot history ---
+   {
+      int scan = Inp_SwingSize * 2 + 100;
+      double h[], l[], c_arr[];
+      if(CopyHigh( _Symbol, PERIOD_CURRENT, 0, scan, h) == scan &&
+         CopyLow(  _Symbol, PERIOD_CURRENT, 0, scan, l) == scan &&
+         CopyClose(_Symbol, PERIOD_CURRENT, 0, scan, c_arr) == scan)
+      {
+         // Scan pivots from oldest to newest
+         for(int i = scan - 1; i >= Inp_SwingSize; i--) {
+            // re-build windows sized for pivot at shift i (from newest-first arrays)
+            // scan up to i in the newest-first array
+            // Pivot at position i in arr (shift=i is i bars ago)
+            // window: [i-sw .. i+sw] in shift terms = [i-sw .. i+sw]
+            int sw = Inp_SwingSize;
+            if(i + sw >= scan) continue;
+            double pval_h = h[i];
+            bool is_ph = true;
+            for(int j = i - sw; j <= i + sw; j++) {
+               if(j == i) continue;
+               if(h[j] >= pval_h) { is_ph = false; break; }
+            }
+            if(is_ph && pval_h > 0.0) {
+               if(g_prev_high == 0.0 || pval_h >= g_prev_high) g_struct_bias = 1;
+               else g_struct_bias = -1;
+               g_prev_high = pval_h;
+               g_high_active = true;
+            }
+            double pval_l = l[i];
+            bool is_pl = true;
+            for(int j = i - sw; j <= i + sw; j++) {
+               if(j == i) continue;
+               if(l[j] <= pval_l) { is_pl = false; break; }
+            }
+            if(is_pl && pval_l > 0.0) {
+               if(g_prev_low == 0.0 || pval_l >= g_prev_low) {
+                  if(g_struct_bias != -1) g_struct_bias = 1;
+               } else {
+                  g_struct_bias = -1;
+               }
+               g_prev_low = pval_l;
+               g_low_active = true;
+            }
+         }
+      }
+   }
+
+   // --- Init VWAP state (shift=1: evaluate from last confirmed bar, not forming) ---
+   g_bar_count = (long)Bars(_Symbol, PERIOD_CURRENT) - 1; // exclude forming bar
+   g_vwap_phL  = g_bar_count - (long)iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, Inp_VWAP_Prd, 1);
+   g_vwap_plL  = g_bar_count - (long)iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  Inp_VWAP_Prd, 1);
+   g_dir_vwap  = g_vwap_phL > g_vwap_plL ? 1 : -1;
+   g_last_swing = g_dir_vwap;
+   g_prev_dir_vwap = g_dir_vwap;
+
+   // CopyTime requires a datetime array, not a scalar reference
+   {
+      datetime tmp[1];
+      CopyTime(_Symbol, PERIOD_CURRENT, 0, 1, tmp); g_last_bar_time  = tmp[0];
+      CopyTime(_Symbol, PERIOD_M5,      0, 1, tmp); g_last_m5_time   = tmp[0];
+      CopyTime(_Symbol, PERIOD_M15,     0, 1, tmp); g_last_m15_time  = tmp[0];
+      CopyTime(_Symbol, PERIOD_H1,      0, 1, tmp); g_last_h1_time   = tmp[0];
+   }
+
+   Print("[CLAW] Phase 1 init complete. ltf_trend=", g_ltf_trend,
+         " m15_trend=", g_m15_trend, " h1_trend=", g_h1_trend,
+         " struct_bias=", g_struct_bias, " fib_trend=", g_trend_fib,
+         " last_swing=", g_last_swing);
+   return INIT_SUCCEEDED;
+}
+
+//==========================================================================
+// OnDeinit
+//==========================================================================
+void OnDeinit(const int reason)
+{
+   int handles[] = {g_h_ema_exec, g_h_atr_exec, g_h_ema_m5,      g_h_atr_m5,
+                    g_h_ema_m15,  g_h_atr_m15,  g_h_ema_h1,      g_h_atr_h1,
+                    g_h_atr_atm_buy, g_h_atr_atm_sell,
+                    g_h_rsi_exec, g_h_rsi_m5,   g_h_ema5_exec,   g_h_ema5_m5};
+   for(int i = 0; i < ArraySize(handles); i++)
+      if(handles[i] != INVALID_HANDLE) IndicatorRelease(handles[i]);
+}
+
+//==========================================================================
+// OnTick — main loop
+//==========================================================================
+void OnTick()
+{
+   // Exit and SL management runs on every tick (not just bar close).
+   // Handles TP hit detection, BE move, trail tightening, runner SL, flip exit.
+   ManageOpenTrade();
+
+   // Signal detection and new entries only on new exec TF bar close.
+   datetime cur_bar_time = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(cur_bar_time == g_last_bar_time) return;  // same bar still forming
+   g_last_bar_time = cur_bar_time;
+   g_bar_count++;
+
+   // ---- Collect current bar values from exec TF ----
+   double buf1[1];
+   double close_now = iClose(_Symbol, PERIOD_CURRENT, 1);  // [1] = last confirmed
+   double high_now  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double low_now   = iLow(_Symbol, PERIOD_CURRENT, 1);
+
+   // ================================================================
+   // MODULE 2: Update exec TF calcLiqTrail (EMA-centered)
+   // ================================================================
+   if(CopyBuffer(g_h_ema_exec, 0, 1, 1, buf1) == 1) {
+      double ema_val = buf1[0];
+      if(CopyBuffer(g_h_atr_exec, 0, 1, 1, buf1) == 1) {
+         double atr_val = buf1[0];
+         StepLiqTrail(ema_val, atr_val, Inp_ATR_Mult, close_now, g_ltf_trend, g_ltf_trail);
+      }
+   }
+
+   // ================================================================
+   // MODULE 2: Update MTF trails when their bar closes
+   // ================================================================
+   datetime m5_time = iTime(_Symbol, PERIOD_M5, 0);
+   if(m5_time != g_last_m5_time) {
+      g_last_m5_time = m5_time;
+      double m5_cl = iClose(_Symbol, PERIOD_M5, 1);
+      if(CopyBuffer(g_h_ema_m5, 0, 1, 1, buf1) == 1) {
+         double ema_v = buf1[0];
+         if(CopyBuffer(g_h_atr_m5, 0, 1, 1, buf1) == 1)
+            StepLiqTrail(ema_v, buf1[0], Inp_ATR_Mult, m5_cl, g_m5_trend, g_m5_trail);
+      }
+   }
+   datetime m15_time = iTime(_Symbol, PERIOD_M15, 0);
+   if(m15_time != g_last_m15_time) {
+      g_last_m15_time = m15_time;
+      double m15_cl = iClose(_Symbol, PERIOD_M15, 1);
+      if(CopyBuffer(g_h_ema_m15, 0, 1, 1, buf1) == 1) {
+         double ema_v = buf1[0];
+         if(CopyBuffer(g_h_atr_m15, 0, 1, 1, buf1) == 1)
+            StepLiqTrail(ema_v, buf1[0], Inp_ATR_Mult, m15_cl, g_m15_trend, g_m15_trail);
+      }
+   }
+   datetime h1_time = iTime(_Symbol, PERIOD_H1, 0);
+   if(h1_time != g_last_h1_time) {
+      g_last_h1_time = h1_time;
+      double h1_cl = iClose(_Symbol, PERIOD_H1, 1);
+      if(CopyBuffer(g_h_ema_h1, 0, 1, 1, buf1) == 1) {
+         double ema_v = buf1[0];
+         if(CopyBuffer(g_h_atr_h1, 0, 1, 1, buf1) == 1)
+            StepLiqTrail(ema_v, buf1[0], Inp_ATR_Mult, h1_cl, g_h1_trend, g_h1_trail);
+      }
+   }
+
+   // ================================================================
+   // MODULE 3: ATM Bot — update dual trails + detect crossover
+   // Pine uses separate ATR series for buy (ATR(c_buy)) and sell (ATR(c_sell)).
+   // ================================================================
+   bool ut_buy_signal  = false;
+   bool ut_sell_signal = false;
+   {
+      double atr_buy_v = 0.0, atr_sell_v = 0.0;
+      bool got_buy  = CopyBuffer(g_h_atr_atm_buy,  0, 1, 1, buf1) == 1;
+      if(got_buy) atr_buy_v = buf1[0];
+      bool got_sell = CopyBuffer(g_h_atr_atm_sell, 0, 1, 1, buf1) == 1;
+      if(got_sell) atr_sell_v = buf1[0];
+
+      if(got_buy && got_sell) {
+         double cp  = g_prev_close_atm;
+         double ptb = g_prev_trail_buy;
+         double pts = g_prev_trail_sell;
+         StepATMTrail(close_now, cp, Inp_A_Buy  * atr_buy_v,  g_trail_buy);
+         StepATMTrail(close_now, cp, Inp_A_Sell * atr_sell_v, g_trail_sell);
+         // Pine: ta.crossover(ema_buy, trail_buy) = close > trail AND close[1] <= trail[1]
+         bool above_buy_cross  = close_now > g_trail_buy  && cp <= ptb;
+         bool below_sell_cross = g_trail_sell > close_now && pts <= cp;
+         ut_buy_signal  = above_buy_cross;
+         ut_sell_signal = below_sell_cross;
+         g_prev_close_atm  = close_now;
+         g_prev_trail_buy  = g_trail_buy;
+         g_prev_trail_sell = g_trail_sell;
+      }
+   }
+
+   // ================================================================
+   // MODULE 4: RSI Smart Signal + M5 confirm + sustain
+   // Pine p_mom: rsi[1] < pmom AND rsi > pmom (crossing from below).
+   // We track g_rsi_prev for the prior-bar check.
+   // ================================================================
+   double rsi_val = 0.0, ema5_val = 0.0;
+   if(CopyBuffer(g_h_rsi_exec,  0, 1, 1, buf1) == 1) rsi_val  = buf1[0];
+   if(CopyBuffer(g_h_ema5_exec, 0, 1, 1, buf1) == 1) ema5_val = buf1[0];
+   double ch_ema5 = ema5_val - g_ema5_prev;
+   // Pine line 627: p_mom = rsi[1] < pmom AND rsi > pmom AND rsi > nmom AND change_ema5 > 0
+   bool p_mom  = g_rsi_prev < Inp_PMom && rsi_val > Inp_PMom && rsi_val > Inp_NMom && ch_ema5 > 0.0;
+   // Pine line 628: n_mom = rsi < nmom AND change_ema5 < 0  (no prior-bar crossing needed)
+   bool n_mom  = rsi_val < Inp_NMom && ch_ema5 < 0.0;
+   bool p_sust = Inp_Sustain && g_positive && rsi_val > Inp_PMom && ch_ema5 > 0.0;
+   bool n_sust = Inp_Sustain && g_negative && rsi_val < Inp_NMom && ch_ema5 < 0.0;
+   if(p_mom || p_sust) { g_positive = true;  g_negative = false; }
+   if(n_mom || n_sust) { g_positive = false; g_negative = true;  }
+   g_rsi_prev  = rsi_val;
+   g_ema5_prev = ema5_val;
+
+   // M5 RSI state — use shift=1 to read the last CONFIRMED M5 bar (not forming).
+   // Pine: request.security uses last closed bar of the TF (lookahead_off default).
+   double rsi_m5 = 0.0, ema5_m5 = 0.0;
+   if(CopyBuffer(g_h_rsi_m5,  0, 1, 1, buf1) == 1) rsi_m5  = buf1[0];
+   if(CopyBuffer(g_h_ema5_m5, 0, 1, 1, buf1) == 1) ema5_m5 = buf1[0];
+   double ch_ema5_m5 = ema5_m5 - g_ema5_m5_prev;
+   // Pine line 648: p_mom_m5 = rsi_m5[1] < pmom AND rsi_m5 > pmom (crossing)
+   bool p_mom_m5 = g_rsi_m5_prev < Inp_PMom && rsi_m5 > Inp_PMom && ch_ema5_m5 > 0.0;
+   bool n_mom_m5 = rsi_m5 < Inp_NMom && ch_ema5_m5 < 0.0;
+   if(p_mom_m5) { g_positive_m5 = true;  g_negative_m5 = false; }
+   if(n_mom_m5) { g_positive_m5 = false; g_negative_m5 = true;  }
+   g_rsi_m5_prev  = rsi_m5;
+   g_ema5_m5_prev = ema5_m5;
+
+   // smartBull / smartBear (Pine: rsi > pmom and change_ema5 > 0 and m5 confirm)
+   bool m5_bull_mom = ch_ema5_m5 > 0.0;
+   bool m5_bear_mom = ch_ema5_m5 < 0.0;
+   g_prev_smart_bull = g_smart_bull;
+   g_prev_smart_bear = g_smart_bear;
+   g_smart_bull = rsi_val > Inp_PMom && ch_ema5 > 0.0 &&
+                  (!Inp_UseM5Confirm || (rsi_m5 > Inp_PMom && m5_bull_mom));
+   g_smart_bear = rsi_val < Inp_NMom && ch_ema5 < 0.0 &&
+                  (!Inp_UseM5Confirm || (rsi_m5 < Inp_NMom && m5_bear_mom));
+   bool new_smart_bull = g_smart_bull && !g_prev_smart_bull;
+   bool new_smart_bear = g_smart_bear && !g_prev_smart_bear;
+
+   // ================================================================
+   // MODULE 5: Market Structure (pivot detection + BOS)
+   // ================================================================
+   bool bull_bos = false, bear_bos = false;
+   {
+      int scan = Inp_SwingSize * 2 + 5;
+      double h_arr[], l_arr[], c_arr[];
+      // All three use shift=1 so the close for BOS is the confirmed bar close,
+      // matching Pine: highSrc = close (bosConfType='Candle Close').
+      if(CopyHigh( _Symbol, PERIOD_CURRENT, 1, scan, h_arr) == scan &&
+         CopyLow(  _Symbol, PERIOD_CURRENT, 1, scan, l_arr) == scan &&
+         CopyClose(_Symbol, PERIOD_CURRENT, 1, scan, c_arr) == scan)
+      {
+         UpdateStructure(h_arr, l_arr, c_arr, bull_bos, bear_bos);
+      }
+   }
+
+   // ================================================================
+   // MODULE 6: Fib Bands — incremental double EMA of HLC3
+   // ================================================================
+   double hlc3 = (high_now + low_now + close_now) / 3.0;
+   double basis_prev = g_fib_ema2;
+   g_fib_ema1   = StepEMA(g_fib_ema1, hlc3, Inp_Fib_Len);
+   g_fib_ema2   = StepEMA(g_fib_ema2, g_fib_ema1, Inp_Fib_Len);
+   if(g_fib_ema2 > basis_prev)      g_trend_fib = 1;
+   else if(g_fib_ema2 < basis_prev) g_trend_fib = -1;
+   // else keep previous value (nz(trend_fib[1]))
+
+   // ================================================================
+   // MODULE 7: VWAP Direction
+   // ================================================================
+   UpdateVWAPDirection(g_bar_count);
+
+   // ================================================================
+   // MODULE 8: Volume Profile — Phase 3 implementation.
+   // Permissive (true) for Phase 1; score slot held in denominator via Inp_VP_Enabled.
+   // ================================================================
+
+   // ================================================================
+   // MODULE 9 + 10: Confidence Engine + Gate Chain
+   // ================================================================
+   bool trail_allows_long  = (g_ltf_trend == 1);
+   bool trail_allows_short = (g_ltf_trend == -1);
+
+   bool mtf_bull_full    = (g_m15_trend == 1 && g_h1_trend == 1);
+   bool mtf_bear_full    = (g_m15_trend == -1 && g_h1_trend == -1);
+   bool mtf_partial_bull = (g_m15_trend == 1 || g_h1_trend == 1);
+   bool mtf_partial_bear = (g_m15_trend == -1 || g_h1_trend == -1);
+
+   bool struct_bull = (g_struct_bias == 1);
+   bool struct_bear = (g_struct_bias == -1);
+
+   bool vwap_bull = (g_last_swing == 1);
+   bool vwap_bear = (g_last_swing == -1);
+
+   bool fib_bull = (g_trend_fib == 1);
+   bool fib_bear = (g_trend_fib == -1);
+
+   // VP Phase 1: permissive — both directions allowed (no score contribution)
+   double bull_conf = ComputeConfidence(mtf_bull_full, mtf_partial_bull, struct_bull,
+                                        g_positive, vwap_bull, fib_bull, true);
+   double bear_conf = ComputeConfidence(mtf_bear_full, mtf_partial_bear, struct_bear,
+                                        g_negative, vwap_bear, fib_bear, true);
+
+   int threshold = ConfidenceThreshold();
+   bool bull_conf_pass = bull_conf >= threshold;
+   bool bear_conf_pass = bear_conf >= threshold;
+
+   // Triggers
+   bool trig_ut_buy     = ut_buy_signal;
+   bool trig_ut_sell    = ut_sell_signal;
+   bool trig_smart_buy  = new_smart_bull;
+   bool trig_smart_sell = new_smart_bear;
+
+   // Gate: trail must allow the direction
+   bool gated_ut_buy     = trig_ut_buy    && trail_allows_long;
+   bool gated_ut_sell    = trig_ut_sell   && trail_allows_short;
+   bool gated_smart_buy  = trig_smart_buy  && trail_allows_long;
+   bool gated_smart_sell = trig_smart_sell && trail_allows_short;
+
+   // Final: confidence must pass
+   bool final_ut_buy     = gated_ut_buy    && bull_conf_pass;
+   bool final_ut_sell    = gated_ut_sell   && bear_conf_pass;
+   bool final_smart_buy  = gated_smart_buy  && bull_conf_pass;
+   bool final_smart_sell = gated_smart_sell && bear_conf_pass;
+
+   bool final_long  = final_ut_buy  || final_smart_buy;
+   bool final_short = final_ut_sell || final_smart_sell;
+
+   // Rejection tracking (for diagnostics)
+   bool rejected_trail_long  = (trig_ut_buy  || trig_smart_buy)  && !trail_allows_long;
+   bool rejected_trail_short = (trig_ut_sell || trig_smart_sell) && !trail_allows_short;
+   bool rejected_conf_long   = (gated_ut_buy  || gated_smart_buy)  && !bull_conf_pass;
+   bool rejected_conf_short  = (gated_ut_sell || gated_smart_sell) && !bear_conf_pass;
+
+   // ================================================================
+   // EXECUTION + SIGNAL LOG
+   // ================================================================
+   datetime bar_time = iTime(_Symbol, PERIOD_CURRENT, 1);
+   string   ts       = TimeToString(bar_time, TIME_DATE | TIME_MINUTES);
+
+   // --- New trade entries (only when flat) ---
+   if(final_long && g_trade_dir == 0) {
+      double sl = CalcPlatinumSL(1, close_now);
+      string src = final_ut_buy ? "UT" : "SMART";
+      Print("[CLAW SIGNAL LONG] ", ts, " src=", src,
+            " close=", DoubleToString(close_now, _Digits),
+            " ltf_trail=", DoubleToString(g_ltf_trail, _Digits),
+            " conf=", DoubleToString(bull_conf, 1), "%",
+            " BSL(target)=", DoubleToString(g_prev_high, _Digits),
+            " sl=", DoubleToString(sl, _Digits));
+      if(sl > 0.0) OpenTrade(1, sl);
+   }
+
+   if(final_short && g_trade_dir == 0) {
+      double sl = CalcPlatinumSL(-1, close_now);
+      string src = final_ut_sell ? "UT" : "SMART";
+      Print("[CLAW SIGNAL SHORT] ", ts, " src=", src,
+            " close=", DoubleToString(close_now, _Digits),
+            " ltf_trail=", DoubleToString(g_ltf_trail, _Digits),
+            " conf=", DoubleToString(bear_conf, 1), "%",
+            " SSL(target)=", DoubleToString(g_prev_low, _Digits),
+            " sl=", DoubleToString(sl, _Digits));
+      if(sl > 0.0) OpenTrade(-1, sl);
+   }
+
+   // --- Pyramid scale-ins when already in a trade ---
+   // newSmartBull/Bear = fresh momentum cross confirms direction — add to winner.
+   if(Inp_PyramidOn && g_trade_dir != 0 && g_trade_phase >= 1) {
+      if(new_smart_bull && g_trade_dir == 1)  OpenScaleIn(1);
+      if(new_smart_bear && g_trade_dir == -1) OpenScaleIn(-1);
+   }
+
+   // --- Rejected signal diagnostics ---
+   if(rejected_trail_long)
+      Print("[CLAW REJECT trail] LONG blocked ltf_trend=", g_ltf_trend, " ts=", ts);
+   if(rejected_trail_short)
+      Print("[CLAW REJECT trail] SHORT blocked ltf_trend=", g_ltf_trend, " ts=", ts);
+   if(rejected_conf_long)
+      Print("[CLAW REJECT conf]  LONG conf=", DoubleToString(bull_conf,1), "% < ", threshold, " ts=", ts);
+   if(rejected_conf_short)
+      Print("[CLAW REJECT conf]  SHORT conf=", DoubleToString(bear_conf,1), "% < ", threshold, " ts=", ts);
+
+   // --- Periodic state pulse every 60 bars (compare against Pine dashboard) ---
+   if(g_bar_count % 60 == 0) {
+      Print("[CLAW STATE] bars=", g_bar_count,
+            " trade_dir=", g_trade_dir, " phase=", g_trade_phase,
+            " ltf=", g_ltf_trend, " m5=", g_m5_trend,
+            " m15=", g_m15_trend, " h1=", g_h1_trend,
+            " atm_buy=", DoubleToString(g_trail_buy, _Digits),
+            " atm_sell=", DoubleToString(g_trail_sell, _Digits),
+            " pos=", g_positive, " neg=", g_negative,
+            " struct=", g_struct_bias,
+            " fib=", g_trend_fib, " vwap=", g_last_swing,
+            " bull_conf=", DoubleToString(bull_conf, 1),
+            " bear_conf=", DoubleToString(bear_conf, 1));
+   }
+}
+//+------------------------------------------------------------------+
